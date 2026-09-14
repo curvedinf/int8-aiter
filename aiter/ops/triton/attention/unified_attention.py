@@ -118,6 +118,18 @@ def select_2d_config(
                 num_stages_2d, num_warps = 1, 4
             else:
                 num_stages_2d, num_warps = 3, 2
+        # G1 cross-path unification (AITER_UA_PIN_TILE=1): decode otherwise
+        # uses TILE_SIZE 64 while prefill uses 32 (gfx908), so the softmax
+        # accumulation order over KV tiles differs between decode and
+        # prefill for the same token — a residual ~1e-4-class seed that
+        # amplifies at 20k context (vllm-gfx908 ledger G1_* series). Pin
+        # the decode tile/stages to the prefill values so both paths
+        # accumulate in the same order.
+        import os as _os
+
+        if _os.environ.get("AITER_UA_PIN_TILE", "0") == "1":
+            TILE_SIZE = 32
+            num_stages_2d, num_warps = 2, 2
 
     BLOCK_Q = BLOCK_M // num_queries_per_kv
     num_stages_2d = min(max_num_stages_2d, num_stages_2d)
