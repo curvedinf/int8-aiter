@@ -305,6 +305,19 @@ def use_2d_kernel(
     target_num_prgms,
     num_2d_prgms,
 ):
+    # G1 cross-path unification (AITER_UA_FORCE_2D=1): decode batches select
+    # the 3D/flash-decoding kernel while prefill uses 2D, and the two kernel
+    # families differ by ~6e-5 on identical inputs — at 20k context that
+    # residual is amplified into decode-vs-prefill distribution divergence
+    # (vllm-gfx908 ledger G1_RESIDUAL_SEED_NARROWED_GDN_PREFILL onward).
+    # Forcing 2D for every batch makes decode and prefill share one kernel
+    # path (2D per-row math is batch-invariant). Decode gets slower; this is
+    # a correctness lever first, speed recovery later.
+    import os as _os
+
+    if _os.environ.get("AITER_UA_FORCE_2D", "0") == "1":
+        return True
+
     # if IS_DEVICE_ARCH_GFX12, always use 3D if all_decode and 2D otherwise
     if IS_DEVICE_ARCH_GFX12:
         return (sliding_window > 0) or (not all_decode)
