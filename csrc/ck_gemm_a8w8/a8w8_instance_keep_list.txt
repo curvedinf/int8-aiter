@@ -1,9 +1,10 @@
 # a8w8 CK instance keep-list (gfx908) -- regenerate with
 # scripts/gen_a8w8_instance_list.py --csv aiter/configs/a8w8_tuned_gemm.csv --gfx gfx908
-# 7 default + 38 tuned ids
+# 7 default + 48 tuned ids
 0
 1
 2
+3
 4
 5
 6
@@ -14,16 +15,21 @@
 13
 14
 15
+18
 19
 20
 21
 22
 23
+28
 29
 30
+31
+32
 35
 37
 39
+40
 41
 43
 44
@@ -37,10 +43,14 @@
 59
 60
 61
+63
+66
 67
 68
 69
+73
 74
+75
 76
 78
 79
