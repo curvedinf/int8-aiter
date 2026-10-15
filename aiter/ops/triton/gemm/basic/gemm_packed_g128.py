@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Packed-weight GS128 INT8 GEMMs; no expanded weight cache."""
 
+import importlib
+
 import torch
 import triton
 
+from aiter.ops import gemm_packed_native
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_packed_g128 import (
     _embedding,
     _gemm,
@@ -11,6 +14,9 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_packed_g128 import (
     _quant,
     _split_reduce,
 )
+
+# Diagnostic module reloads must pick up edited HIP sources and bindings.
+importlib.reload(gemm_packed_native)
 
 # Derived GS128 scales only: checkpoint bytes stay packed, and INT8 weights
 # are still formed inside each GEMM. The serving weights are immutable.
@@ -156,33 +162,50 @@ def packed_gemm(
         if split_k > 1
         else y
     )
-    _gemm[(triton.cdiv(m, bm), triton.cdiv(n, 128), split_k)](
-        q,
-        scales,
-        packed,
-        grid,
-        ws,
-        wg,
-        partial,
-        ys,
-        m,
-        n,
-        full_k,
-        start,
-        length,
-        relu2,
-        quant_out,
-        bm,
-        codec,
-        WG_PER_ROW=codec == "nvfp4" and wg.numel() != 1,
-        SPLIT_K=split_k,
-        WEIGHT_SCALES=weight_groups,
-        CACHED_SCALES=True,
-        num_warps=8 if bm >= 128 else 4,
-        num_stages=1,
-        matrix_instr_nonkdim=16,
-        enable_fp_fusion=False,
-    )
+    if codec == "nvfp4" and split_k > 1 and start % 4 == 0 and length % 4 == 0:
+        gemm_packed_native.packed_nvfp4(
+            q,
+            scales,
+            packed,
+            ws,
+            wg,
+            weight_groups,
+            partial,
+            m,
+            n,
+            full_k,
+            start,
+            length,
+            split_k,
+        )
+    else:
+        _gemm[(triton.cdiv(m, bm), triton.cdiv(n, 128), split_k)](
+            q,
+            scales,
+            packed,
+            grid,
+            ws,
+            wg,
+            partial,
+            ys,
+            m,
+            n,
+            full_k,
+            start,
+            length,
+            relu2,
+            quant_out,
+            bm,
+            codec,
+            WG_PER_ROW=codec == "nvfp4" and wg.numel() != 1,
+            SPLIT_K=split_k,
+            WEIGHT_SCALES=weight_groups,
+            CACHED_SCALES=True,
+            num_warps=8 if bm >= 128 else 4,
+            num_stages=1,
+            matrix_instr_nonkdim=16,
+            enable_fp_fusion=False,
+        )
     if split_k > 1:
         _split_reduce[(m, triton.cdiv(n, 128))](
             partial, y, ys, m, n, split_k, relu2, quant_out
