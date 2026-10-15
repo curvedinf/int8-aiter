@@ -100,7 +100,9 @@ def packed_gemm(
         (m, n), device=q.device, dtype=torch.int8 if quant_out else torch.float32
     )
     ys = torch.empty((m, triton.cdiv(n, 128)), device=q.device, dtype=torch.float32)
-    _gemm[(triton.cdiv(m, 16), triton.cdiv(n, 128))](
+    # Amortize packed decoding across tokens without changing GS128 groups.
+    bm = (256 if m >= 256 else 32) if codec == "nvfp4" else 16
+    _gemm[(triton.cdiv(m, bm), triton.cdiv(n, 128))](
         q,
         scales,
         packed,
@@ -116,10 +118,10 @@ def packed_gemm(
         length,
         relu2,
         quant_out,
-        16,
+        bm,
         codec,
         WG_PER_ROW=codec == "nvfp4" and wg.numel() != 1,
-        num_warps=4,
+        num_warps=8 if bm == 256 else 4,
         num_stages=1,
         matrix_instr_nonkdim=16,
         enable_fp_fusion=False,

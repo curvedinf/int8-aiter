@@ -56,7 +56,7 @@ def _decode_nvfp4(
     value = tl.where(
         mag < 2,
         mag.to(tl.float32) * 0.5,
-        tldevice.ldexp((2 + (mag & 1)).to(tl.float32), (mag >> 1) - 2),
+        (((mag >> 1) + 126) << 23 | ((mag & 1) << 22)).to(tl.float32, bitcast=True),
     )
     value = tl.where((nibble & 8) != 0, -value, value)
     # E4M3 scales are read as bytes: gfx908 has no native FP8 load/compute.
@@ -68,7 +68,7 @@ def _decode_nvfp4(
     scale = tl.where(
         exp == 0,
         mantissa.to(tl.float32) * (2.0**-9),
-        tldevice.ldexp((8 + mantissa).to(tl.float32), exp - 10),
+        (((exp + 120) << 23) | (mantissa << 20)).to(tl.float32, bitcast=True),
     )
     scale = tl.where((bits & 128) != 0, -scale, scale)
     if WG_PER_ROW:
@@ -146,7 +146,7 @@ def _gemm(
             w = _decode_nvfp4(W, WS, WG, rn, START + local_k, N, K, WG_PER_ROW)
         w = tl.where(local_k[None, :] < LENGTH, w, 0.0)
         sw = tl.maximum(tl.div_rn(tl.max(tl.abs(w), 1), 127.0), 1.0e-30)
-        wq = tldevice.nearbyint(tl.div_rn(w, sw[:, None])).to(tl.int8)
+        wq = tldevice.nearbyint(w * tl.div_rn(1.0, sw)[:, None]).to(tl.int8)
         x = tl.load(
             X + xm[:, None] * LENGTH + local_k[None, :],
             (rm[:, None] < M) & (local_k[None, :] < LENGTH),
