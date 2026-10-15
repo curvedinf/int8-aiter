@@ -92,3 +92,33 @@ def packed_gemm(
     )
     if status:
         raise RuntimeError(f"Packed GS128 HIP launch failed: {status}")
+
+
+def packed_experts(
+    q, scales, packed, groups, grid, out, plan, routes, n, k, start, length, topk, down
+):
+    module, _ = _load()
+    fn = module.launch_routed
+    fn.argtypes = (
+        [ctypes.c_void_p] * 9 + [ctypes.c_int] * 8 + [ctypes.c_int64, ctypes.c_void_p]
+    )
+    fn.restype = ctypes.c_int
+    sorted_ids, experts, count = plan
+    status = fn(
+        *[
+            t.data_ptr()
+            for t in (q, scales, packed, groups, grid, out, sorted_ids, experts, count)
+        ],
+        routes,
+        n,
+        k,
+        start,
+        length,
+        experts.numel(),
+        topk,
+        int(down),
+        packed.stride(0),
+        torch.cuda.current_stream(q.device).cuda_stream,
+    )
+    if status:
+        raise RuntimeError(f"Packed expert HIP launch failed: {status}")

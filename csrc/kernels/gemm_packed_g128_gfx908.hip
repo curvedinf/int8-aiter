@@ -117,3 +117,70 @@ extern "C" int launch_packed(const int8_t* x,const float* xs,const uint8_t* w,
  else launch_codec<2>(x,xs,w,ws,wg,gs,codebook,y,m,n,k,start,length,per_row,split,mt,stream);
  return (int)hipGetLastError();
 }
+
+template<int MT,int CODEC>
+__global__ void packed_routed(const int8_t* X,const float* XS,const uint8_t* W,
+ const uint8_t* WS,const float* WG,const float* GS,const uint8_t* GRID,float* Y,
+ int M,int N,int K,int start,int L,int per_row,int split,
+ const int* SORT,const int* EXP,const int* COUNT,int topk,int down,int64_t stride) {
+ if(blockIdx.x*16>=*COUNT)return;
+ int expert=EXP[blockIdx.x];
+ W+=expert*stride;
+ GS+=(int64_t)expert*N*((L+127)/128);
+ int lane=threadIdx.x%64,wave=threadIdx.x/64;
+ int n=blockIdx.y*128+wave*16+lane%16;
+ int m0=blockIdx.x*(16*MT);
+ float accum[MT][4]={};
+ int ng=(L+127)/128,span=(ng+split-1)/split;
+ int begin=blockIdx.z*span,end=min(begin+span,ng);
+ for(int g=begin;g<end;++g){
+  float sw=n<N?GS[n*ng+g]:1.f;
+  float inv=1.f/sw;
+  float wg=(CODEC==0&&n<N)?WG[per_row?n:0]:0.f;
+  I4 acc[MT]={};
+  #pragma unroll
+  for(int sub=0;sub<8;++sub){
+   int lk=g*128+sub*16+(lane/16)*4,k=start+lk;
+   uint32_t b=0;
+   if(n<N&&lk<L){
+    b=decode4<CODEC>(W,WS,GRID,n,K,k,wg,inv);
+   }
+   #pragma unroll
+   for(int t=0;t<MT;++t){
+    int m=m0+t*16+lane%16;
+    int route=SORT[m];
+    int xm=down?route:route/topk;
+    int a=(route<M&&lk<L)?*reinterpret_cast<const int*>(X+(int64_t)xm*L+lk):0;
+    acc[t]=__builtin_amdgcn_mfma_i32_16x16x16i8(a,(int)b,acc[t],0,0,0);
+   }
+  }
+  #pragma unroll
+  for(int t=0;t<MT;++t){
+   #pragma unroll
+   for(int j=0;j<4;++j){
+    int m=m0+t*16+(lane/16)*4+j;
+    int route=SORT[m];
+    int xm=down?route:route/topk;
+    float sx=route<M?XS[xm*ng+g]:0.f;
+    accum[t][j]+=((float)acc[t][j]*sx)*sw;
+   }
+  }
+ }
+ #pragma unroll
+ for(int t=0;t<MT;++t){
+  #pragma unroll
+  for(int j=0;j<4;++j){
+   int m=m0+t*16+(lane/16)*4+j;
+   int route=SORT[m];
+   if(route<M&&n<N)Y[(int64_t)blockIdx.z*M*N+(int64_t)route*N+n]=accum[t][j];
+  }
+ }
+}
+
+extern "C" int launch_routed(const int8_t* x,const float* xs,const uint8_t* w,
+ const float* gs,const uint8_t* codebook,float* y,const int* sorted,const int* experts,const int* count,
+ int routes,int n,int k,int start,int length,int tiles,int topk,int down,int64_t stride,hipStream_t stream){
+ dim3 grid(tiles,(n+127)/128,1);
+ hipLaunchKernelGGL((packed_routed<1,2>),grid,dim3(512),0,stream,x,xs,w,w,xs,gs,codebook,y,routes,n,k,start,length,0,1,sorted,experts,count,topk,down,stride);
+ return (int)hipGetLastError();
+}

@@ -257,6 +257,33 @@ def packed_experts(q, scales, packed, grid, ids, *, start=0, down=False, plan=No
         "iq2_xxs",
         routed=True,
     )
+    if m <= 64 and plan is not None and start % 4 == 0 and length % 4 == 0:
+        partial = (
+            torch.empty((routes, n), device=q.device, dtype=torch.float32)
+            if not down
+            else y
+        )
+        gemm_packed_native.packed_experts(
+            q,
+            scales,
+            packed,
+            weight_groups,
+            grid,
+            partial,
+            plan,
+            routes,
+            n,
+            blocks * 256,
+            start,
+            length,
+            topk,
+            down,
+        )
+        if not down:
+            _split_reduce[(routes, triton.cdiv(n, 128))](
+                partial, y, ys, routes, n, 1, True, True
+            )
+        return y if down else (y, ys)
     sorted_ids, experts, count = (None, ids, None) if plan is None else plan
     tiles = routes if plan is None else experts.numel()
     _gemm[(tiles, triton.cdiv(n, 128))](
