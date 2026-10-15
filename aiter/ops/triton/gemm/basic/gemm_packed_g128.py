@@ -156,20 +156,32 @@ def packed_gemm(
     weight_groups = _cached_weight_scales(
         packed, grid, ws, wg, n, full_k, start, length, codec
     )
+    native = (
+        m <= 64
+        and start % 4 == 0
+        and length % 4 == 0
+        and (
+            (codec == "nvfp4" and length >= 2048)
+            or (codec != "nvfp4" and not relu2 and not quant_out)
+        )
+    )
     split_k = 8 if codec == "nvfp4" and m <= 64 and length >= 2048 else 1
+    if native and codec != "nvfp4":
+        split_k = 8 if n <= 512 or (m <= 16 and n < 8192) else 4
     partial = (
         torch.empty((split_k, m, n), device=q.device, dtype=torch.float32)
         if split_k > 1
         else y
     )
-    if codec == "nvfp4" and split_k > 1 and start % 4 == 0 and length % 4 == 0:
-        gemm_packed_native.packed_nvfp4(
+    if native:
+        gemm_packed_native.packed_gemm(
             q,
             scales,
             packed,
             ws,
             wg,
             weight_groups,
+            grid,
             partial,
             m,
             n,
@@ -177,6 +189,7 @@ def packed_gemm(
             start,
             length,
             split_k,
+            codec,
         )
     else:
         _gemm[(triton.cdiv(m, bm), triton.cdiv(n, 128), split_k)](

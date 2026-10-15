@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Lazy HIP kernel for packed NVFP4 decode on gfx908."""
+"""Lazy HIP kernel for packed-weight decode on gfx908."""
 
 import ctypes
 import fcntl
@@ -15,7 +15,7 @@ import torch
 @functools.lru_cache(maxsize=1)
 def _load():
     root = Path(__file__).resolve().parents[2]
-    source = root / "csrc/kernels/gemm_packed_nvfp4_gfx908.hip"
+    source = root / "csrc/kernels/gemm_packed_g128_gfx908.hip"
     compiler = Path(os.environ.get("ROCM_PATH", "/opt/rocm")) / "bin/hipcc"
     version = subprocess.check_output([str(compiler), "--version"])
     digest = hashlib.sha256(
@@ -48,19 +48,20 @@ def _load():
                 )
             temporary.replace(library)
     module = ctypes.CDLL(str(library))
-    fn = module.launch_nv4
-    fn.argtypes = [ctypes.c_void_p] * 7 + [ctypes.c_int] * 8 + [ctypes.c_void_p]
+    fn = module.launch_packed
+    fn.argtypes = [ctypes.c_void_p] * 8 + [ctypes.c_int] * 9 + [ctypes.c_void_p]
     fn.restype = ctypes.c_int
     return module, fn
 
 
-def packed_nvfp4(
+def packed_gemm(
     q,
     scales,
     packed,
     weight_scales,
     global_scale,
     groups,
+    grid,
     out,
     m,
     n,
@@ -68,24 +69,26 @@ def packed_nvfp4(
     start,
     length,
     split,
+    codec,
 ):
     """Launch partial sums; the caller retains the GS128 output epilogue."""
     _, fn = _load()
-    mt = 1 if m <= 16 else 2
+    mt = 1 if m <= 16 or (codec != "nvfp4" and n <= 512) else 2
     status = fn(
         *[
             t.data_ptr()
-            for t in (q, scales, packed, weight_scales, global_scale, groups, out)
+            for t in (q, scales, packed, weight_scales, global_scale, groups, grid, out)
         ],
         m,
         n,
         k,
         start,
         length,
-        int(global_scale.numel() != 1),
+        int(codec == "nvfp4" and global_scale.numel() != 1),
         split,
         mt,
+        {"nvfp4": 0, "q8_0": 1, "iq2_xxs": 2}[codec],
         torch.cuda.current_stream(q.device).cuda_stream,
     )
     if status:
-        raise RuntimeError(f"Packed NVFP4 HIP launch failed: {status}")
+        raise RuntimeError(f"Packed GS128 HIP launch failed: {status}")
