@@ -269,7 +269,7 @@ def packed_experts(q, scales, packed, grid, ids, *, start=0, down=False, plan=No
         "iq2_xxs",
         routed=True,
     )
-    if m <= 64 and plan is not None and start % 128 == 0 and length % 128 == 0:
+    if m <= 64 and plan is not None and start % 4 == 0 and length % 4 == 0:
         partial = (
             torch.empty((routes, n), device=q.device, dtype=torch.float32)
             if not down

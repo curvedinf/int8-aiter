@@ -101,6 +101,8 @@ def cached_gemm(q, scales, packed, grid, groups, ws, wg, full_k, start, codec):
     bm, bn, warps = (
         (16, 64, 4) if m <= 16 else (64, 64, 4) if m <= 64 else (128, 128, 8)
     )
+    if m <= 64 and n <= 2048:
+        bm = 16
     config = {
         "BLOCK_SIZE_M": bm,
         "BLOCK_SIZE_N": bn,
