@@ -14,9 +14,9 @@ __device__ __forceinline__ float fp8(int v) {
  float x=e?__uint_as_float(((e+120)<<23)|(m<<20)):m*(1.0f/512);
  return (v&128)?-x:x;
 }
-template<int CODEC>
+template<int CODEC,bool HINT=false>
 __device__ __forceinline__ uint32_t decode4(const uint8_t* W,const uint8_t* WS,
- const uint8_t* GRID,int n,int K,int k,float wg,float inv){
+ const uint8_t* GRID,int n,int K,uint32_t k,float wg,float inv,float d_hint=0.f){
  uint32_t result=0;
  if constexpr(CODEC==0){
   uint16_t packed=*reinterpret_cast<const uint16_t*>(W+(int64_t)n*(K/2)+k/2);
@@ -37,7 +37,7 @@ __device__ __forceinline__ uint32_t decode4(const uint8_t* W,const uint8_t* WS,
   }
  }else{
   const uint8_t* base=W+(int64_t)n*(K/256)*66+(k/256)*66;
-  float d=__half2float(*reinterpret_cast<const __half*>(base));
+  float d=HINT?d_hint:__half2float(*reinterpret_cast<const __half*>(base));
   int sub=(k%256)/32,lane=(k%32)/8,j0=k%8;
   int code=base[2+sub*8+lane];
   uint32_t bits;__builtin_memcpy(&bits,base+6+sub*8,4);
@@ -137,20 +137,25 @@ __global__ void packed_routed(const int8_t* X,const float* XS,const uint8_t* W,
   float sw=n<N?GS[n*ng+g]:1.f;
   float inv=1.f/sw;
   float wg=(CODEC==0&&n<N)?WG[per_row?n:0]:0.f;
+  float d=0.f;
+  if(DOWN && n<N){
+   const uint8_t* base=W+(int64_t)n*(K/256)*66+((start+g*128)/256)*66;
+   d=__half2float(*reinterpret_cast<const __half*>(base));
+  }
   I4 acc[MT]={};
   #pragma unroll
   for(int sub=0;sub<8;++sub){
-   int lk=g*128+sub*16+(lane/16)*4,k=start+lk;
+   int lk=g*128+sub*16+(lane/16)*4,k=(start/128+g)*128+sub*16+(lane/16)*4;
    uint32_t b=0;
-   if(n<N&&lk<L){
-    b=decode4<CODEC>(W,WS,GRID,n,K,k,wg,inv);
+   if(n<N){
+    b=decode4<CODEC,DOWN>(W,WS,GRID,n,K,k,wg,inv,d);
    }
    #pragma unroll
    for(int t=0;t<MT;++t){
     int m=m0+t*16+lane%16;
     int route=SORT[m];
     int xm=DOWN?route:route/topk;
-    int a=(route<M&&lk<L)?*reinterpret_cast<const int*>(X+(int64_t)xm*L+lk):0;
+    int a=(route<M)?*reinterpret_cast<const int*>(X+(int64_t)xm*L+lk):0;
     acc[t]=__builtin_amdgcn_mfma_i32_16x16x16i8(a,(int)b,acc[t],0,0,0);
    }
   }
