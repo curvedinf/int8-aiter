@@ -118,6 +118,8 @@ def _gemm(
     GROUPED: tl.constexpr = False,
     WG_PER_ROW: tl.constexpr = False,
     SPLIT_K: tl.constexpr = 1,
+    WEIGHT_SCALES=None,
+    CACHED_SCALES: tl.constexpr = False,
 ):
     rm = tl.program_id(0) * BM + tl.arange(0, BM)
     if ROUTED:
@@ -131,6 +133,8 @@ def _gemm(
             expert = tl.load(IDS + route).to(tl.int64)
             rm = tl.where(tl.arange(0, BM) == 0, route, M)
         W += expert * WSTRIDE
+        if CACHED_SCALES:
+            WEIGHT_SCALES += expert * N * tl.cdiv(LENGTH, 128)
     xm = rm
     if ROUTED and not DOWN:
         xm = rm // TOPK
@@ -154,7 +158,10 @@ def _gemm(
         else:
             w = _decode_nvfp4(W, WS, WG, rn, START + local_k, N, K, WG_PER_ROW)
         w = tl.where(local_k[None, :] < LENGTH, w, 0.0)
-        sw = tl.maximum(tl.div_rn(tl.max(tl.abs(w), 1), 127.0), 1.0e-30)
+        if CACHED_SCALES:
+            sw = tl.load(WEIGHT_SCALES + rn * tl.cdiv(LENGTH, 128) + group, rn < N, 1.0)
+        else:
+            sw = tl.maximum(tl.div_rn(tl.max(tl.abs(w), 1), 127.0), 1.0e-30)
         wq = tldevice.nearbyint(w * tl.div_rn(1.0, sw)[:, None]).to(tl.int8)
         x = tl.load(
             X + xm[:, None] * LENGTH + local_k[None, :],
@@ -227,3 +234,37 @@ def _split_reduce(
         tl.store(YS + row * tl.cdiv(N, 128) + tl.program_id(1), sy)
     else:
         tl.store(Y + row * N + n, acc, n < N)
+
+
+@triton.jit
+def _prepare_weight_scales(
+    W,
+    GRID,
+    WS,
+    WG,
+    OUT,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    START: tl.constexpr,
+    LENGTH: tl.constexpr,
+    CODEC: tl.constexpr,
+    WSTRIDE: tl.constexpr,
+    ROUTED: tl.constexpr,
+    WG_PER_ROW: tl.constexpr,
+):
+    tile = tl.program_id(0)
+    group = tl.program_id(1)
+    expert = tile // tl.cdiv(N, 16)
+    rn = (tile % tl.cdiv(N, 16)) * 16 + tl.arange(0, 16)
+    local_k = group * 128 + tl.arange(0, 128)
+    if ROUTED:
+        W += expert * WSTRIDE
+    if CODEC == "iq2_xxs":
+        w = _decode(W, GRID, rn, START + local_k, N, K)
+    elif CODEC == "q8_0":
+        w = _decode_q8(W, rn, START + local_k, N, K)
+    else:
+        w = _decode_nvfp4(W, WS, WG, rn, START + local_k, N, K, WG_PER_ROW)
+    w = tl.where(local_k[None, :] < LENGTH, w, 0.0)
+    sw = tl.maximum(tl.div_rn(tl.max(tl.abs(w), 1), 127.0), 1.0e-30)
+    tl.store(OUT + (expert * N + rn) * tl.cdiv(LENGTH, 128) + group, sw, rn < N)

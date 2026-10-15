@@ -7,9 +7,50 @@ import triton
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_packed_g128 import (
     _embedding,
     _gemm,
+    _prepare_weight_scales,
     _quant,
     _split_reduce,
 )
+
+# Derived GS128 scales only: checkpoint bytes stay packed, and INT8 weights
+# are still formed inside each GEMM. The serving weights are immutable.
+_weight_scale_cache = {}
+
+
+def _cached_weight_scales(
+    packed, grid, ws, wg, n, k, start, length, codec, *, routed=False
+):
+    version = None if packed.is_inference() else packed._version
+    key = (packed.data_ptr(), start, length, codec, version)
+    entry = _weight_scale_cache.get(key)
+    if entry is not None:
+        return entry[1]
+    experts = packed.shape[0] if routed else 1
+    out = torch.empty(
+        (experts, n, triton.cdiv(length, 128)),
+        device=packed.device,
+        dtype=torch.float32,
+    )
+    _prepare_weight_scales[(experts * triton.cdiv(n, 16), triton.cdiv(length, 128))](
+        packed,
+        grid,
+        ws,
+        wg,
+        out,
+        n,
+        k,
+        start,
+        length,
+        codec,
+        packed.stride(0) if routed else 0,
+        routed,
+        codec == "nvfp4" and wg.numel() != 1,
+        num_warps=4,
+        enable_fp_fusion=False,
+    )
+    # Keep the source alive so its address cannot be recycled under this key.
+    _weight_scale_cache[key] = (packed, out)
+    return out
 
 
 def make_grid(device):
@@ -106,6 +147,9 @@ def packed_gemm(
         bm = 128 if codec == "q8_0" and length <= 512 else 256
     else:
         bm = 32 if codec == "nvfp4" else 16
+    weight_groups = _cached_weight_scales(
+        packed, grid, ws, wg, n, full_k, start, length, codec
+    )
     split_k = 8 if codec == "nvfp4" and m <= 64 and length >= 2048 else 1
     partial = (
         torch.empty((split_k, m, n), device=q.device, dtype=torch.float32)
@@ -132,6 +176,8 @@ def packed_gemm(
         codec,
         WG_PER_ROW=codec == "nvfp4" and wg.numel() != 1,
         SPLIT_K=split_k,
+        WEIGHT_SCALES=weight_groups,
+        CACHED_SCALES=True,
         num_warps=8 if bm >= 128 else 4,
         num_stages=1,
         matrix_instr_nonkdim=16,
@@ -163,6 +209,18 @@ def packed_experts(q, scales, packed, grid, ids, *, start=0, down=False, plan=No
     ys = torch.empty(
         (routes, triton.cdiv(n, 128)), device=q.device, dtype=torch.float32
     )
+    weight_groups = _cached_weight_scales(
+        packed,
+        grid,
+        scales,
+        scales,
+        n,
+        blocks * 256,
+        start,
+        length,
+        "iq2_xxs",
+        routed=True,
+    )
     sorted_ids, experts, count = (None, ids, None) if plan is None else plan
     tiles = routes if plan is None else experts.numel()
     _gemm[(tiles, triton.cdiv(n, 128))](
@@ -191,6 +249,8 @@ def packed_experts(q, scales, packed, grid, ids, *, start=0, down=False, plan=No
         sorted_ids,
         count,
         plan is not None,
+        WEIGHT_SCALES=weight_groups,
+        CACHED_SCALES=True,
         num_warps=4,
         num_stages=1,
         matrix_instr_nonkdim=16,
