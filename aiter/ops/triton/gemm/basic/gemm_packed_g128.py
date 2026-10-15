@@ -22,8 +22,13 @@ def make_grid(device):
 
 
 def quantize(x):
-    if x.ndim != 2 or not x.is_cuda or not x.is_contiguous():
-        raise ValueError("Expected contiguous GPU activation matrix")
+    if (
+        x.ndim != 2
+        or not x.is_cuda
+        or not x.is_contiguous()
+        or not x.is_floating_point()
+    ):
+        raise ValueError("Expected contiguous floating-point GPU activation matrix")
     m, k = x.shape
     q = torch.empty_like(x, dtype=torch.int8)
     s = torch.empty((m, triton.cdiv(k, 128)), device=x.device, dtype=torch.float32)
