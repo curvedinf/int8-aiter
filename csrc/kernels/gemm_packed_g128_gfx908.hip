@@ -118,7 +118,7 @@ extern "C" int launch_packed(const int8_t* x,const float* xs,const uint8_t* w,
  return (int)hipGetLastError();
 }
 
-template<int MT,int CODEC>
+template<int MT,int CODEC,int NW,bool DOWN>
 __global__ void packed_routed(const int8_t* X,const float* XS,const uint8_t* W,
  const uint8_t* WS,const float* WG,const float* GS,const uint8_t* GRID,float* Y,
  int M,int N,int K,int start,int L,int per_row,int split,
@@ -128,7 +128,7 @@ __global__ void packed_routed(const int8_t* X,const float* XS,const uint8_t* W,
  W+=expert*stride;
  GS+=(int64_t)expert*N*((L+127)/128);
  int lane=threadIdx.x%64,wave=threadIdx.x/64;
- int n=blockIdx.y*128+wave*16+lane%16;
+ int n=blockIdx.y*(NW*16)+wave*16+lane%16;
  int m0=blockIdx.x*(16*MT);
  float accum[MT][4]={};
  int ng=(L+127)/128,span=(ng+split-1)/split;
@@ -149,7 +149,7 @@ __global__ void packed_routed(const int8_t* X,const float* XS,const uint8_t* W,
    for(int t=0;t<MT;++t){
     int m=m0+t*16+lane%16;
     int route=SORT[m];
-    int xm=down?route:route/topk;
+    int xm=DOWN?route:route/topk;
     int a=(route<M&&lk<L)?*reinterpret_cast<const int*>(X+(int64_t)xm*L+lk):0;
     acc[t]=__builtin_amdgcn_mfma_i32_16x16x16i8(a,(int)b,acc[t],0,0,0);
    }
@@ -160,7 +160,7 @@ __global__ void packed_routed(const int8_t* X,const float* XS,const uint8_t* W,
    for(int j=0;j<4;++j){
     int m=m0+t*16+(lane/16)*4+j;
     int route=SORT[m];
-    int xm=down?route:route/topk;
+    int xm=DOWN?route:route/topk;
     float sx=route<M?XS[xm*ng+g]:0.f;
     accum[t][j]+=((float)acc[t][j]*sx)*sw;
    }
@@ -177,10 +177,20 @@ __global__ void packed_routed(const int8_t* X,const float* XS,const uint8_t* W,
  }
 }
 
+template<int NW,bool DOWN>
+void launch_route_impl(const int8_t* x,const float* xs,const uint8_t* w,
+ const float* gs,const uint8_t* codebook,float* y,const int* sorted,const int* experts,const int* count,
+ int routes,int n,int k,int start,int length,int tiles,int topk,int64_t stride,hipStream_t stream){
+ dim3 grid(tiles,(n+NW*16-1)/(NW*16),1);
+ hipLaunchKernelGGL((packed_routed<1,2,NW,DOWN>),grid,dim3(NW*64),0,stream,x,xs,w,w,xs,gs,codebook,y,routes,n,k,start,length,0,1,sorted,experts,count,topk,DOWN,stride);
+}
 extern "C" int launch_routed(const int8_t* x,const float* xs,const uint8_t* w,
  const float* gs,const uint8_t* codebook,float* y,const int* sorted,const int* experts,const int* count,
- int routes,int n,int k,int start,int length,int tiles,int topk,int down,int64_t stride,hipStream_t stream){
- dim3 grid(tiles,(n+127)/128,1);
- hipLaunchKernelGGL((packed_routed<1,2>),grid,dim3(512),0,stream,x,xs,w,w,xs,gs,codebook,y,routes,n,k,start,length,0,1,sorted,experts,count,topk,down,stride);
+ int routes,int n,int k,int start,int length,int tiles,int topk,int down,int waves,int64_t stride,hipStream_t stream){
+ #define ROUTE(NW,D) launch_route_impl<NW,D>(x,xs,w,gs,codebook,y,sorted,experts,count,routes,n,k,start,length,tiles,topk,stride,stream)
+ if(waves==2){if(down){ROUTE(2,true);}else{ROUTE(2,false);}}
+ else if(waves==4){if(down){ROUTE(4,true);}else{ROUTE(4,false);}}
+ else {if(down){ROUTE(8,true);}else{ROUTE(8,false);}}
+ #undef ROUTE
  return (int)hipGetLastError();
 }

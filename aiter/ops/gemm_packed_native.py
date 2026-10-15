@@ -100,7 +100,7 @@ def packed_experts(
     module, _ = _load()
     fn = module.launch_routed
     fn.argtypes = (
-        [ctypes.c_void_p] * 9 + [ctypes.c_int] * 8 + [ctypes.c_int64, ctypes.c_void_p]
+        [ctypes.c_void_p] * 9 + [ctypes.c_int] * 9 + [ctypes.c_int64, ctypes.c_void_p]
     )
     fn.restype = ctypes.c_int
     sorted_ids, experts, count = plan
@@ -117,6 +117,7 @@ def packed_experts(
         experts.numel(),
         topk,
         int(down),
+        int(os.environ.get("VLLM_BOLT_ROUTED_WAVES", "2")),
         packed.stride(0),
         torch.cuda.current_stream(q.device).cuda_stream,
     )
