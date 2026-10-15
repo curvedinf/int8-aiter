@@ -156,6 +156,18 @@ def packed_gemm(
     weight_groups = _cached_weight_scales(
         packed, grid, ws, wg, n, full_k, start, length, codec
     )
+    from aiter.ops.triton.gemm.basic.packed_dense_cache import cached_gemm
+
+    result = cached_gemm(
+        q, scales, packed, grid, weight_groups, ws, wg, full_k, start, codec
+    )
+    if result is not None:
+        if relu2 or quant_out:
+            _split_reduce[(m, triton.cdiv(n, 128))](
+                result, y, ys, m, n, 1, relu2, quant_out
+            )
+            return (y, ys) if quant_out else y
+        return result
     native = (
         m <= 64
         and start % 4 == 0
