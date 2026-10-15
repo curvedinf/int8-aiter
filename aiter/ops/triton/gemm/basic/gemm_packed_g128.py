@@ -8,6 +8,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_packed_g128 import (
     _embedding,
     _gemm,
     _quant,
+    _split_reduce,
 )
 
 
@@ -105,14 +106,20 @@ def packed_gemm(
         bm = 128 if codec == "q8_0" and length <= 512 else 256
     else:
         bm = 32 if codec == "nvfp4" else 16
-    _gemm[(triton.cdiv(m, bm), triton.cdiv(n, 128))](
+    split_k = 8 if codec == "nvfp4" and m <= 64 and length >= 2048 else 1
+    partial = (
+        torch.empty((split_k, m, n), device=q.device, dtype=torch.float32)
+        if split_k > 1
+        else y
+    )
+    _gemm[(triton.cdiv(m, bm), triton.cdiv(n, 128), split_k)](
         q,
         scales,
         packed,
         grid,
         ws,
         wg,
-        y,
+        partial,
         ys,
         m,
         n,
@@ -124,11 +131,16 @@ def packed_gemm(
         bm,
         codec,
         WG_PER_ROW=codec == "nvfp4" and wg.numel() != 1,
+        SPLIT_K=split_k,
         num_warps=8 if bm >= 128 else 4,
         num_stages=1,
         matrix_instr_nonkdim=16,
         enable_fp_fusion=False,
     )
+    if split_k > 1:
+        _split_reduce[(m, triton.cdiv(n, 128))](
+            partial, y, ys, m, n, split_k, relu2, quant_out
+        )
     return (y, ys) if quant_out else y
 
 

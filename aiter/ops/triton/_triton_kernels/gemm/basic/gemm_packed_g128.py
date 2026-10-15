@@ -117,6 +117,7 @@ def _gemm(
     COUNT=None,
     GROUPED: tl.constexpr = False,
     WG_PER_ROW: tl.constexpr = False,
+    SPLIT_K: tl.constexpr = 1,
 ):
     rm = tl.program_id(0) * BM + tl.arange(0, BM)
     if ROUTED:
@@ -136,7 +137,15 @@ def _gemm(
     rn = tl.program_id(1) * 128 + tl.arange(0, 128)
     rk = tl.arange(0, 128)
     acc = tl.zeros((BM, 128), tl.float32)
-    for group in range(tl.cdiv(LENGTH, 128)):
+    groups: tl.constexpr = (LENGTH + 127) // 128
+    span: tl.constexpr = (groups + SPLIT_K - 1) // SPLIT_K
+    if SPLIT_K == 1:
+        begin = 0
+        end = groups
+    else:
+        begin = tl.program_id(2) * span
+        end = tl.minimum((tl.program_id(2) + 1) * span, groups)
+    for group in range(begin, end):
         local_k = group * 128 + rk
         if CODEC == "iq2_xxs":
             w = _decode(W, GRID, rn, START + local_k, N, K)
@@ -155,6 +164,13 @@ def _gemm(
         sx = tl.load(XS + xm * tl.cdiv(LENGTH, 128) + group, rm < M, 0)
         dot = tl.dot(x, tl.trans(wq), out_dtype=tl.int32)
         acc += dot.to(tl.float32) * sx[:, None] * sw[None, :]
+    if SPLIT_K > 1:
+        tl.store(
+            Y + tl.program_id(2) * M * N + rm[:, None] * N + rn[None, :],
+            acc,
+            (rm[:, None] < M) & (rn[None, :] < N),
+        )
+        return
     if RELU2:
         acc = tl.maximum(acc, 0.0)
         acc *= acc
@@ -183,3 +199,31 @@ def _embedding(
     idx = tl.load(IDS + row)
     value = _decode_q8(W, tl.full((1,), 0, tl.int32) + idx, ks, N, K)
     tl.store(OUT + row * K + ks, tl.reshape(value, (B,)), ks < K)
+
+
+@triton.jit
+def _split_reduce(
+    P,
+    Y,
+    YS,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    RELU2: tl.constexpr,
+    QUANT_OUT: tl.constexpr,
+):
+    row = tl.program_id(0)
+    n = tl.program_id(1) * 128 + tl.arange(0, 128)
+    acc = tl.full((128,), 0, tl.float32)
+    for s in tl.static_range(SPLIT_K):
+        acc += tl.load(P + s * M * N + row * N + n, n < N, 0)
+    if RELU2:
+        acc = tl.maximum(acc, 0.0)
+        acc *= acc
+    if QUANT_OUT:
+        sy = tl.maximum(tl.div_rn(tl.max(tl.abs(acc), 0), 127.0), 1.0e-30)
+        q = tldevice.nearbyint(tl.div_rn(acc, sy)).to(tl.int8)
+        tl.store(Y + row * N + n, q, n < N)
+        tl.store(YS + row * tl.cdiv(N, 128) + tl.program_id(1), sy)
+    else:
+        tl.store(Y + row * N + n, acc, n < N)
