@@ -271,7 +271,16 @@ def packed_experts(
         "iq2_xxs",
         routed=True,
     )
-    if m <= 64 and plan is not None and start % 4 == 0 and length % 4 == 0:
+    if m > 64 and cache is None and plan is not None:
+        from .packed_expert_cache import find_projection
+
+        cache = find_projection(packed, start, length, down=down)
+    if (
+        (m <= 64 or cache is not None)
+        and plan is not None
+        and start % 4 == 0
+        and length % 4 == 0
+    ):
         partial = (
             torch.empty((routes, n), device=q.device, dtype=torch.float32)
             if not down
