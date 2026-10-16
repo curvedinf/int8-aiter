@@ -118,13 +118,16 @@ extern "C" int launch_packed(const int8_t* x,const float* xs,const uint8_t* w,
  return (int)hipGetLastError();
 }
 
-template<int MT,int CODEC,int NW,bool DOWN,bool ALIGNED>
+template<int MT,int CODEC,int NW,bool DOWN,bool ALIGNED,bool CACHED=false>
 __global__ void packed_routed(const int8_t* X,const float* XS,const uint8_t* W,
  const uint8_t* WS,const float* WG,const float* GS,const uint8_t* GRID,float* Y,
  int M,int N,int K,int start,int L,int per_row,int split,
- const int* SORT,const int* EXP,const int* COUNT,int topk,int down,int64_t stride) {
+ const int* SORT,const int* EXP,const int* COUNT,int topk,int down,int64_t stride,
+ const int8_t* CACHE,const int* MAP) {
  if(blockIdx.x*16>=*COUNT)return;
  int expert=EXP[blockIdx.x];
+ int slot=-1;
+ if constexpr(CACHED)slot=MAP[expert];
  W+=expert*stride;
  GS+=(int64_t)expert*N*((L+127)/128);
  int lane=threadIdx.x%64,wave=threadIdx.x/64;
@@ -138,7 +141,7 @@ __global__ void packed_routed(const int8_t* X,const float* XS,const uint8_t* W,
   float inv=1.f/sw;
   float wg=(CODEC==0&&n<N)?WG[per_row?n:0]:0.f;
   float d=0.f;
-  if(DOWN && ALIGNED && n<N){
+  if(DOWN && ALIGNED && n<N && slot<0){
    const uint8_t* base=W+(int64_t)n*(K/256)*66+((start+g*128)/256)*66;
    d=__half2float(*reinterpret_cast<const __half*>(base));
   }
@@ -149,7 +152,12 @@ __global__ void packed_routed(const int8_t* X,const float* XS,const uint8_t* W,
    int k=ALIGNED?(start/128+g)*128+sub*16+(lane/16)*4:start+lk;
    uint32_t b=0;
    if(n<N && (ALIGNED || lk<L)){
-    b=decode4<CODEC,(DOWN && ALIGNED)>(W,WS,GRID,n,K,k,wg,inv,d);
+    if constexpr(CACHED){
+     if(slot>=0)b=*reinterpret_cast<const uint32_t*>(CACHE+((int64_t)slot*N+n)*L+lk);
+     else b=decode4<CODEC,(DOWN && ALIGNED)>(W,WS,GRID,n,K,k,wg,inv,d);
+    }else{
+     b=decode4<CODEC,(DOWN && ALIGNED)>(W,WS,GRID,n,K,k,wg,inv,d);
+    }
    }
    #pragma unroll
    for(int t=0;t<MT;++t){
@@ -183,17 +191,32 @@ __global__ void packed_routed(const int8_t* X,const float* XS,const uint8_t* W,
  }
 }
 
-template<int NW,bool DOWN,bool ALIGNED>
+template<int NW,bool DOWN,bool ALIGNED,bool CACHED=false>
 void launch_route_impl(const int8_t* x,const float* xs,const uint8_t* w,
  const float* gs,const uint8_t* codebook,float* y,const int* sorted,const int* experts,const int* count,
- int routes,int n,int k,int start,int length,int tiles,int topk,int64_t stride,hipStream_t stream){
+ int routes,int n,int k,int start,int length,int tiles,int topk,int64_t stride,hipStream_t stream,
+ const int8_t* cache=nullptr,const int* map=nullptr){
  dim3 grid(tiles,(n+NW*16-1)/(NW*16),1);
- hipLaunchKernelGGL((packed_routed<1,2,NW,DOWN,ALIGNED>),grid,dim3(NW*64),0,stream,x,xs,w,w,xs,gs,codebook,y,routes,n,k,start,length,0,1,sorted,experts,count,topk,DOWN,stride);
+ hipLaunchKernelGGL((packed_routed<1,2,NW,DOWN,ALIGNED,CACHED>),grid,dim3(NW*64),0,stream,x,xs,w,w,xs,gs,codebook,y,routes,n,k,start,length,0,1,sorted,experts,count,topk,DOWN,stride,cache,map);
 }
 extern "C" int launch_routed(const int8_t* x,const float* xs,const uint8_t* w,
  const float* gs,const uint8_t* codebook,float* y,const int* sorted,const int* experts,const int* count,
  int routes,int n,int k,int start,int length,int tiles,int topk,int down,int waves,int64_t stride,hipStream_t stream){
  #define ROUTE_IMPL(NW,D,A) launch_route_impl<NW,D,A>(x,xs,w,gs,codebook,y,sorted,experts,count,routes,n,k,start,length,tiles,topk,stride,stream)
+ #define ROUTE(NW,D) do { if(start%128==0 && length%128==0){ROUTE_IMPL(NW,D,true);}else{ROUTE_IMPL(NW,D,false);} } while(0)
+ if(waves==2){if(down){ROUTE(2,true);}else{ROUTE(2,false);}}
+ else if(waves==4){if(down){ROUTE(4,true);}else{ROUTE(4,false);}}
+ else {if(down){ROUTE(8,true);}else{ROUTE(8,false);}}
+ #undef ROUTE
+ #undef ROUTE_IMPL
+ return (int)hipGetLastError();
+}
+
+extern "C" int launch_routed_cached(const int8_t* x,const float* xs,const uint8_t* w,
+ const float* gs,const uint8_t* codebook,float* y,const int* sorted,const int* experts,const int* count,
+ int routes,int n,int k,int start,int length,int tiles,int topk,int down,int waves,int64_t stride,
+ const int8_t* cache,const int* map,hipStream_t stream){
+ #define ROUTE_IMPL(NW,D,A) launch_route_impl<NW,D,A,true>(x,xs,w,gs,codebook,y,sorted,experts,count,routes,n,k,start,length,tiles,topk,stride,stream,cache,map)
  #define ROUTE(NW,D) do { if(start%128==0 && length%128==0){ROUTE_IMPL(NW,D,true);}else{ROUTE_IMPL(NW,D,false);} } while(0)
  if(waves==2){if(down){ROUTE(2,true);}else{ROUTE(2,false);}}
  else if(waves==4){if(down){ROUTE(4,true);}else{ROUTE(4,false);}}

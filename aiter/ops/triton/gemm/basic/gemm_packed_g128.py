@@ -246,7 +246,9 @@ def packed_embedding(weight, ids, width, dtype=torch.bfloat16):
     return out
 
 
-def packed_experts(q, scales, packed, grid, ids, *, start=0, down=False, plan=None):
+def packed_experts(
+    q, scales, packed, grid, ids, *, start=0, down=False, plan=None, cache=None
+):
     m, topk = ids.shape
     routes = m * topk
     n, blocks = packed.shape[1:3]
@@ -290,6 +292,7 @@ def packed_experts(q, scales, packed, grid, ids, *, start=0, down=False, plan=No
             length,
             topk,
             down,
+            cache,
         )
         if not down:
             _split_reduce[(routes, triton.cdiv(n, 128))](

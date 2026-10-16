@@ -95,12 +95,30 @@ def packed_gemm(
 
 
 def packed_experts(
-    q, scales, packed, groups, grid, out, plan, routes, n, k, start, length, topk, down
+    q,
+    scales,
+    packed,
+    groups,
+    grid,
+    out,
+    plan,
+    routes,
+    n,
+    k,
+    start,
+    length,
+    topk,
+    down,
+    cache=None,
 ):
     module, _ = _load()
-    fn = module.launch_routed
+    fn = module.launch_routed if cache is None else module.launch_routed_cached
     fn.argtypes = (
-        [ctypes.c_void_p] * 9 + [ctypes.c_int] * 9 + [ctypes.c_int64, ctypes.c_void_p]
+        [ctypes.c_void_p] * 9
+        + [ctypes.c_int] * 9
+        + [ctypes.c_int64]
+        + ([ctypes.c_void_p] * 2 if cache is not None else [])
+        + [ctypes.c_void_p]
     )
     fn.restype = ctypes.c_int
     sorted_ids, experts, count = plan
@@ -119,6 +137,11 @@ def packed_experts(
         int(down),
         int(os.environ.get("VLLM_BOLT_ROUTED_WAVES", "2")),
         packed.stride(0),
+        *(
+            [cache.weight.data_ptr(), cache.mapping.data_ptr()]
+            if cache is not None
+            else []
+        ),
         torch.cuda.current_stream(q.device).cuda_stream,
     )
     if status:
