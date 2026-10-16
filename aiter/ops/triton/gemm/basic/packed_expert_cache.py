@@ -341,22 +341,3 @@ def get_cache(up, down, grid, intermediate, start):
     _CACHE[key] = cache
     _BYTES[up.device] = _BYTES.get(up.device, 0) + size
     return cache
-
-
-def find_projection(packed, start, length, *, down):
-    """Use an existing expert copy during prefill without allocating or ranking.
-
-    Decode owns cache admission and refresh. Loading/profiling can call before
-    those caches exist, in which case the ordinary packed prefill path remains.
-    """
-    for entry in _CACHE.values():
-        if down:
-            if (
-                packed is entry.source_down
-                and start == entry.start
-                and length == entry.intermediate
-            ):
-                return entry.down
-        elif packed is entry.source_up and start == 0 and length == entry.hidden:
-            return entry.up
-    return None
