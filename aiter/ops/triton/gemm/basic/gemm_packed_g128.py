@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Packed-weight GS128 INT8 GEMMs; no expanded weight cache."""
+"""Packed GS128 GEMMs with cached group scales and bounded dense conversion."""
 
 import importlib
 
@@ -18,8 +18,8 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_packed_g128 import (
 # Diagnostic module reloads must pick up edited HIP sources and bindings.
 importlib.reload(gemm_packed_native)
 
-# Derived GS128 scales only: checkpoint bytes stay packed, and INT8 weights
-# are still formed inside each GEMM. The serving weights are immutable.
+# Packed fallback paths retain sources and derived GS128 scales. Static dense
+# promotion transfers scales to the layer and removes the source entry here.
 _weight_scale_cache = {}
 
 

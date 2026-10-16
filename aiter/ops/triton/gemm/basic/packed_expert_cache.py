@@ -2,6 +2,7 @@
 """Bounded, frequency-ranked INT8 GS128 copies of routed IQ2 experts."""
 
 import os
+import weakref
 
 import torch
 import triton
@@ -235,6 +236,59 @@ class ExpertCache:
 # Keep allocations alive across diagnostic module reloads and graph replays.
 _CACHE = globals().get("_CACHE", {})
 _BYTES = globals().get("_BYTES", {})
+_LAYERS = globals().get("_LAYERS", {})
+
+
+def register_layer(up, down, intermediate, start):
+    """Register geometry before warmup so auto capacity covers every layer."""
+    key = (up.device, up.data_ptr(), down.data_ptr(), start, intermediate)
+    if key not in _LAYERS:
+        if any(k[0] == up.device for k in _CACHE):
+            raise RuntimeError(
+                "Register all expert layers before allocating auto caches"
+            )
+        _LAYERS[key] = (weakref.ref(up), up.shape[0], intermediate, down.shape[1])
+
+
+def plan_slots(device, budget):
+    """Equalize layer coverage, then fill spare bytes with the smallest pairs."""
+    layers = {k: v for k, v in _LAYERS.items() if k[0] == device and v[0]() is not None}
+    if not layers:
+        return {}
+
+    def size(v, slots):
+        _, experts, intermediate, hidden = v
+        if not slots:
+            return 0
+        return (
+            2 * slots * intermediate * hidden
+            + (2 * triton.next_power_of_2(experts) + 2 * slots + 1) * 4
+        )
+
+    lo, hi = 0, max(v[1] for v in layers.values())
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if sum(size(v, min(mid, v[1])) for v in layers.values()) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    slots = {k: min(lo, v[1]) for k, v in layers.items()}
+    remaining = budget - sum(size(layers[k], s) for k, s in slots.items())
+    # Registration order is model order on every TP rank; stable sorting keeps
+    # allocation deterministic even for layers with identical geometry.
+    for k, v in sorted(layers.items(), key=lambda item: 2 * item[1][2] * item[1][3]):
+        current = slots[k]
+        step = 2 * v[2] * v[3] + 8
+        if not current:
+            first = size(v, 1)
+            if remaining < first:
+                continue
+            slots[k] = current = 1
+            remaining -= first
+        extra = min(v[1] - current, remaining // step)
+        slots[k] += extra
+        remaining -= extra * step
+    return slots
 
 
 def get_cache(up, down, grid, intermediate, start):
@@ -244,7 +298,15 @@ def get_cache(up, down, grid, intermediate, start):
     key = (up.device, up.data_ptr(), down.data_ptr(), start, intermediate)
     if key in _CACHE:
         return _CACHE[key]
-    slots = min(int(os.environ.get("VLLM_BOLT_EXPERT_CACHE_SLOTS", "64")), up.shape[0])
+    setting = os.environ.get("VLLM_BOLT_EXPERT_CACHE_SLOTS", "64")
+    if setting == "auto":
+        if key not in _LAYERS:
+            register_layer(up, down, intermediate, start)
+        slots = plan_slots(up.device, budget).get(key, 0)
+        if slots == 0:
+            return None
+    else:
+        slots = min(int(setting), up.shape[0])
     period = int(os.environ.get("VLLM_BOLT_EXPERT_CACHE_REFRESH", "128"))
     if slots < 1 or period < 1 or period > 1024:
         raise ValueError("Expert cache requires positive slots and refresh in 1..1024")

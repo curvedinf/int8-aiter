@@ -18,6 +18,7 @@ from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import gemm_a8w8_blockscal
 # Reloading tuning code must not allocate duplicate copies of immutable weights.
 _CACHE = globals().get("_CACHE", {})
 _BYTES = globals().get("_BYTES", {})
+_RELEASED_BYTES = globals().get("_RELEASED_BYTES", {})
 
 
 @triton.jit
@@ -52,17 +53,8 @@ def _expand(
     )
 
 
-def cached_gemm(q, scales, packed, grid, groups, ws, wg, full_k, start, codec):
-    """Return FP32 GEMM output, or None when this weight exceeds the cache budget.
-
-    Only dense projections call this function. The original checkpoint and its
-    existing derived scales stay alive; the cache adds one byte per weight.
-    No eviction occurs while captured graphs can reference a cached tensor.
-    """
-    m, k = q.shape
+def _cache_weight(packed, grid, groups, ws, wg, full_k, start, k, codec):
     n = packed.shape[0]
-    if m <= 64 and n <= 512:
-        return None
     device = packed.device
     budget = int(float(os.environ.get("VLLM_BOLT_DENSE_CACHE_GIB", "0")) * 2**30)
     if budget <= 0:
@@ -94,10 +86,69 @@ def cached_gemm(q, scales, packed, grid, groups, ws, wg, full_k, start, codec):
             num_warps=4,
             enable_fp_fusion=False,
         )
-        _CACHE[key] = (packed, groups, weight)
+        entry = (packed, groups, weight)
+        _CACHE[key] = entry
         _BYTES[device] = _BYTES.get(device, 0) + size
+    return key, entry
+
+
+def prepare_dense_weight(
+    packed, grid, length, *, start=0, codec="iq2_xxs", ws=None, wg=None
+):
+    """Transfer a budgeted dense projection to immutable INT8-only ownership.
+
+    Call after checkpoint loading and before graph capture. On budget exhaustion
+    return None without releasing the packed source. No cache entry retains the
+    source on success; callers must also replace their parameter and delete the
+    codec metadata. Expert weights never enter this path.
+    """
+    from .gemm_packed_g128 import _cached_weight_scales
+
+    n = packed.shape[0]
+    full_k = packed.shape[1] * (
+        2 if codec == "nvfp4" else 256 if codec == "iq2_xxs" else 32
+    )
+    if codec == "nvfp4":
+        if ws is None or wg is None:
+            raise ValueError("NVFP4 requires original block and global scales")
+        ws = ws.view(torch.uint8)
     else:
-        weight = entry[2]
+        ws = wg = grid
+    groups = _cached_weight_scales(
+        packed, grid, ws, wg, n, full_k, start, length, codec
+    )
+    result = _cache_weight(packed, grid, groups, ws, wg, full_k, start, length, codec)
+    if result is None:
+        return None
+    key, (_, groups, weight) = result
+    del _CACHE[key]
+    # The old address may be reused as soon as the caller drops its parameter.
+    # A distinct key prevents collisions with future packed allocations.
+    _CACHE[(packed.device, "resident", weight.data_ptr())] = (None, groups, weight)
+    from .gemm_packed_g128 import _weight_scale_cache
+
+    scale_key = (packed.data_ptr(), start, length, codec, key[2])
+    _weight_scale_cache.pop(scale_key, None)
+    return weight, groups
+
+
+def cached_gemm(q, scales, packed, grid, groups, ws, wg, full_k, start, codec):
+    """Lazy cache with packed fallback for callers retaining original weights."""
+    m, k = q.shape
+    if m <= 64 and packed.shape[0] <= 512:
+        return None
+    result = _cache_weight(packed, grid, groups, ws, wg, full_k, start, k, codec)
+    if result is None:
+        return None
+    return int8_gemm(q, scales, result[1][2], groups)
+
+
+def int8_gemm(q, scales, weight, groups, *, relu2=False, quant_out=False):
+    """GS128 GEMM using only immutable INT8 weights and FP32 group scales."""
+    m, k = q.shape
+    n = weight.shape[0]
+    if weight.dtype != torch.int8 or weight.shape[1] != k:
+        raise ValueError("Expected INT8 [N,K] weights matching the activations")
     bm, bn, warps = (
         (16, 64, 4) if m <= 16 else (64, 64, 4) if m <= 64 else (128, 128, 8)
     )
@@ -115,6 +166,22 @@ def cached_gemm(q, scales, packed, grid, groups, ws, wg, full_k, start, codec):
         "SPLITK_BLOCK_SIZE": 2048,
         "enable_fp_fusion": False,
     }
-    return gemm_a8w8_blockscale(
+    result = gemm_a8w8_blockscale(
         q, weight, scales, groups[0], dtype=torch.float32, config=config
     )
+    if not relu2 and not quant_out:
+        return result
+    from aiter.ops.triton._triton_kernels.gemm.basic.gemm_packed_g128 import (
+        _split_reduce,
+    )
+
+    output = torch.empty(
+        (m, n), device=q.device, dtype=torch.int8 if quant_out else torch.float32
+    )
+    output_scales = torch.empty(
+        (m, triton.cdiv(n, 128)), device=q.device, dtype=torch.float32
+    )
+    _split_reduce[(m, triton.cdiv(n, 128))](
+        result, output, output_scales, m, n, 1, relu2, quant_out
+    )
+    return (output, output_scales) if quant_out else output
