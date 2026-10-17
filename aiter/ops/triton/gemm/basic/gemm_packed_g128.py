@@ -8,6 +8,7 @@ import triton
 
 from aiter.ops import gemm_packed_native
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_packed_g128 import (
+    _combine_experts,
     _embedding,
     _gemm,
     _prepare_weight_scales,
@@ -244,6 +245,34 @@ def packed_embedding(weight, ids, width, dtype=torch.bfloat16):
         weight, ids.contiguous(), out, ids.numel(), width, weight.shape[0], 256
     )
     return out
+
+
+def combine_experts(y, weights, dtype):
+    """Fuse nine route products, ATen's FP32 sum order, and the output cast."""
+    if y.ndim != 2 or weights.ndim != 2:
+        raise ValueError("Expected route values [M*topk,N] and weights [M,topk]")
+    m, topk = weights.shape
+    if y.shape[0] != m * topk or y.device != weights.device:
+        raise ValueError("Route values and weights must match on the same device")
+    n = y.shape[-1]
+    if (
+        not y.is_cuda
+        or topk != 9
+        or n % 4
+        or y.dtype != torch.float32
+        or weights.dtype != torch.float32
+        or not y.is_contiguous()
+        or not weights.is_contiguous()
+        or dtype not in (torch.float32, torch.float16, torch.bfloat16)
+    ):
+        return (y.view(m, topk, n) * weights[..., None]).sum(1).to(dtype)
+    output = torch.empty((m, n), device=y.device, dtype=dtype)
+    if m and n:
+        block = 256 if m <= 64 else 512
+        _combine_experts[(m, triton.cdiv(n, block))](
+            y, weights, output, n, block, num_warps=4, enable_fp_fusion=False
+        )
+    return output
 
 
 def packed_experts(

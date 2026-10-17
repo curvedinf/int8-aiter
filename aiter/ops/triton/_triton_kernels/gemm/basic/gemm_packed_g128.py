@@ -209,6 +209,34 @@ def _embedding(
 
 
 @triton.jit
+def _route_product(Y, WEIGHTS, token, cols, route: tl.constexpr, N: tl.constexpr):
+    value = tl.load(Y + (token * 9 + route) * N + cols, cols < N, 0.0)
+    weight = tl.load(WEIGHTS + token * 9 + route)
+    return value * weight
+
+
+@triton.jit
+def _combine_experts(Y, WEIGHTS, OUT, N: tl.constexpr, B: tl.constexpr):
+    token = tl.program_id(0)
+    cols = tl.program_id(1) * B + tl.arange(0, B)
+    # ATen's non-contiguous nine-element sum does not split the input across
+    # warps. It uses four accumulators, then combines them from left to right.
+    zero = tl.full((B,), 0.0, tl.float32)
+    a0 = zero + _route_product(Y, WEIGHTS, token, cols, 0, N)
+    a1 = zero + _route_product(Y, WEIGHTS, token, cols, 1, N)
+    a2 = zero + _route_product(Y, WEIGHTS, token, cols, 2, N)
+    a3 = zero + _route_product(Y, WEIGHTS, token, cols, 3, N)
+    a0 = a0 + _route_product(Y, WEIGHTS, token, cols, 4, N)
+    a1 = a1 + _route_product(Y, WEIGHTS, token, cols, 5, N)
+    a2 = a2 + _route_product(Y, WEIGHTS, token, cols, 6, N)
+    a3 = a3 + _route_product(Y, WEIGHTS, token, cols, 7, N)
+    a0 = a0 + _route_product(Y, WEIGHTS, token, cols, 8, N)
+    result = ((a0 + a1) + a2) + a3
+    result = tl.where(result == 0.0, 0.0, result)
+    tl.store(OUT + token * N + cols, result, cols < N)
+
+
+@triton.jit
 def _split_reduce(
     P,
     Y,
