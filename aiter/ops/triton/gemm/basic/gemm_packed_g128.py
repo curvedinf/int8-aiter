@@ -247,8 +247,20 @@ def packed_embedding(weight, ids, width, dtype=torch.bfloat16):
 
 
 def packed_experts(
-    q, scales, packed, grid, ids, *, start=0, down=False, plan=None, cache=None
+    q,
+    scales,
+    packed,
+    grid,
+    ids,
+    *,
+    start=0,
+    down=False,
+    plan=None,
+    cache=None,
+    block_size=16,
 ):
+    if block_size not in (16, 32, 64) or (block_size != 16 and plan is None):
+        raise ValueError("Route tiles require a matching 16/32/64-row alignment plan")
     m, topk = ids.shape
     routes = m * topk
     n, blocks = packed.shape[1:3]
@@ -271,7 +283,13 @@ def packed_experts(
         "iq2_xxs",
         routed=True,
     )
-    if m <= 64 and plan is not None and start % 4 == 0 and length % 4 == 0:
+    if (
+        m <= 64
+        and block_size == 16
+        and plan is not None
+        and start % 4 == 0
+        and length % 4 == 0
+    ):
         partial = (
             torch.empty((routes, n), device=q.device, dtype=torch.float32)
             if not down
@@ -317,7 +335,7 @@ def packed_experts(
         length,
         not down,
         not down,
-        16,
+        block_size,
         "iq2_xxs",
         experts,
         topk,

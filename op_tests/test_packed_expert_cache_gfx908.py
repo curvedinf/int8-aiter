@@ -57,15 +57,15 @@ def make_weights(intermediate=576, start=0, experts=240, hidden=1024):
     return up, down, ops.make_grid("cuda")
 
 
-def make_plan(ids, experts):
+def make_plan(ids, experts, block_size=16):
     flat = ids.cpu().flatten().tolist()
     routes = len(flat)
     sorted_ids, expert_ids = [], []
     for e in range(experts):
         selected = [i for i, value in enumerate(flat) if value == e]
-        selected += [routes] * (-len(selected) % 16)
+        selected += [routes] * (-len(selected) % block_size)
         sorted_ids.extend(selected)
-        expert_ids.extend([e] * (len(selected) // 16))
+        expert_ids.extend([e] * (len(selected) // block_size))
     return (
         torch.tensor(sorted_ids, device="cuda", dtype=torch.int32),
         torch.tensor(expert_ids, device="cuda", dtype=torch.int32),
