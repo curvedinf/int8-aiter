@@ -120,7 +120,11 @@ def _gemm(
     SPLIT_K: tl.constexpr = 1,
     WEIGHT_SCALES=None,
     CACHED_SCALES: tl.constexpr = False,
+    EXPERT_WEIGHT=None,
+    EXPERT_MAP=None,
+    EXPERT_CACHED: tl.constexpr = False,
 ):
+    slot = -1
     rm = tl.program_id(0) * BM + tl.arange(0, BM)
     if ROUTED:
         route = tl.program_id(0)
@@ -133,6 +137,9 @@ def _gemm(
             expert = tl.load(IDS + route).to(tl.int64)
             rm = tl.where(tl.arange(0, BM) == 0, route, M)
         W += expert * WSTRIDE
+        if EXPERT_CACHED:
+            slot = tl.load(EXPERT_MAP + expert)
+            EXPERT_WEIGHT += tl.maximum(slot, 0).to(tl.int64) * N * LENGTH
         if CACHED_SCALES:
             WEIGHT_SCALES += expert * N * tl.cdiv(LENGTH, 128)
     xm = rm
@@ -151,18 +158,30 @@ def _gemm(
         end = tl.minimum((tl.program_id(2) + 1) * span, groups)
     for group in range(begin, end):
         local_k = group * 128 + rk
-        if CODEC == "iq2_xxs":
-            w = _decode(W, GRID, rn, START + local_k, N, K)
-        elif CODEC == "q8_0":
-            w = _decode_q8(W, rn, START + local_k, N, K)
-        else:
-            w = _decode_nvfp4(W, WS, WG, rn, START + local_k, N, K, WG_PER_ROW)
-        w = tl.where(local_k[None, :] < LENGTH, w, 0.0)
-        if CACHED_SCALES:
+        if EXPERT_CACHED and slot >= 0:
+            # One expert per program makes this branch uniform. Never load a
+            # cold slot: its allocation can still contain unwritten values.
+            wq = tl.load(
+                EXPERT_WEIGHT + rn[:, None] * LENGTH + local_k[None, :],
+                (rn[:, None] < N) & (local_k[None, :] < LENGTH),
+                0,
+            )
             sw = tl.load(WEIGHT_SCALES + rn * tl.cdiv(LENGTH, 128) + group, rn < N, 1.0)
         else:
-            sw = tl.maximum(tl.div_rn(tl.max(tl.abs(w), 1), 127.0), 1.0e-30)
-        wq = tldevice.nearbyint(w * tl.div_rn(1.0, sw)[:, None]).to(tl.int8)
+            if CODEC == "iq2_xxs":
+                w = _decode(W, GRID, rn, START + local_k, N, K)
+            elif CODEC == "q8_0":
+                w = _decode_q8(W, rn, START + local_k, N, K)
+            else:
+                w = _decode_nvfp4(W, WS, WG, rn, START + local_k, N, K, WG_PER_ROW)
+            w = tl.where(local_k[None, :] < LENGTH, w, 0.0)
+            if CACHED_SCALES:
+                sw = tl.load(
+                    WEIGHT_SCALES + rn * tl.cdiv(LENGTH, 128) + group, rn < N, 1.0
+                )
+            else:
+                sw = tl.maximum(tl.div_rn(tl.max(tl.abs(w), 1), 127.0), 1.0e-30)
+            wq = tldevice.nearbyint(w * tl.div_rn(1.0, sw)[:, None]).to(tl.int8)
         x = tl.load(
             X + xm[:, None] * LENGTH + local_k[None, :],
             (rm[:, None] < M) & (local_k[None, :] < LENGTH),

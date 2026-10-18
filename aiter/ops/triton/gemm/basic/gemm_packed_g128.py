@@ -348,6 +348,13 @@ def packed_experts(
         return y if down else (y, ys)
     sorted_ids, experts, count = (None, ids, None) if plan is None else plan
     tiles = routes if plan is None else experts.numel()
+    prefill_cache = None
+    if m > 64 and plan is not None:
+        prefill_cache = cache
+        if prefill_cache is None:
+            from .packed_expert_cache import find_projection
+
+            prefill_cache = find_projection(packed, start, length, down=down)
     _gemm[(tiles, triton.cdiv(n, 128))](
         q,
         scales,
@@ -376,6 +383,9 @@ def packed_experts(
         plan is not None,
         WEIGHT_SCALES=weight_groups,
         CACHED_SCALES=True,
+        EXPERT_WEIGHT=None if prefill_cache is None else prefill_cache.weight,
+        EXPERT_MAP=None if prefill_cache is None else prefill_cache.mapping,
+        EXPERT_CACHED=prefill_cache is not None,
         num_warps=4,
         num_stages=1,
         matrix_instr_nonkdim=16,
