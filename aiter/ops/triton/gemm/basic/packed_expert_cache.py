@@ -193,8 +193,13 @@ class ExpertCache:
             routed=True,
         )
 
-    def step(self, ids):
+    def step(self, ids, rerank=False):
         ids = ids.contiguous()
+        if rerank:
+            # Force the ranking recompute on this call instead of waiting
+            # for the phase counter to wrap; the refresh below then expands
+            # newly admitted slots immediately.
+            self.phase.zero_()
         _update_routes[(1,)](
             ids,
             self.counts,
