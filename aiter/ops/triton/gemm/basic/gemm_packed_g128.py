@@ -287,6 +287,7 @@ def packed_experts(
     plan=None,
     cache=None,
     block_size=16,
+    direct_int8=False,
 ):
     if block_size not in (16, 32, 64) or (block_size != 16 and plan is None):
         raise ValueError("Route tiles require a matching 16/32/64-row alignment plan")
@@ -295,7 +296,9 @@ def packed_experts(
     n, blocks = packed.shape[1:3]
     length = q.shape[-1]
     y = torch.empty(
-        (routes, n), device=q.device, dtype=torch.float32 if down else torch.int8
+        (routes, n),
+        device=q.device,
+        dtype=torch.float32 if down and not direct_int8 else torch.int8,
     )
     ys = torch.empty(
         (routes, triton.cdiv(n, 128)), device=q.device, dtype=torch.float32
@@ -313,7 +316,8 @@ def packed_experts(
         routed=True,
     )
     if (
-        m <= 64
+        not direct_int8
+        and m <= 64
         and block_size == 16
         and plan is not None
         and start % 4 == 0
@@ -349,7 +353,7 @@ def packed_experts(
     sorted_ids, experts, count = (None, ids, None) if plan is None else plan
     tiles = routes if plan is None else experts.numel()
     prefill_cache = None
-    if m > 64 and plan is not None:
+    if (m > 64 or direct_int8) and plan is not None:
         prefill_cache = cache
         if prefill_cache is None:
             from .packed_expert_cache import find_projection
@@ -370,7 +374,7 @@ def packed_experts(
         start,
         length,
         not down,
-        not down,
+        not down or direct_int8,
         block_size,
         "iq2_xxs",
         experts,
@@ -391,4 +395,4 @@ def packed_experts(
         matrix_instr_nonkdim=16,
         enable_fp_fusion=False,
     )
-    return y if down else (y, ys)
+    return y if down and not direct_int8 else (y, ys)

@@ -143,17 +143,33 @@ def cached_gemm(q, scales, packed, grid, groups, ws, wg, full_k, start, codec):
     return int8_gemm(q, scales, result[1][2], groups)
 
 
-def int8_gemm(q, scales, weight, groups, *, relu2=False, quant_out=False):
+def int8_gemm(
+    q,
+    scales,
+    weight,
+    groups,
+    *,
+    relu2=False,
+    quant_out=False,
+    fused_quant_out=False,
+    bias=None,
+):
     """GS128 GEMM using only immutable INT8 weights and FP32 group scales."""
     m, k = q.shape
     n = weight.shape[0]
     if weight.dtype != torch.int8 or weight.shape[1] != k:
         raise ValueError("Expected INT8 [N,K] weights matching the activations")
+    if bias is not None and not fused_quant_out:
+        raise ValueError("Bias epilogue requires fused_quant_out")
     bm, bn, warps = (
         (16, 64, 4) if m <= 16 else (64, 64, 4) if m <= 64 else (128, 128, 8)
     )
     if m <= 64 and n <= 2048:
         bm = 16
+    if fused_quant_out:
+        if not quant_out:
+            raise ValueError("Fused GS128 output requires quant_out")
+        bn = 128
     config = {
         "BLOCK_SIZE_M": bm,
         "BLOCK_SIZE_N": bn,
@@ -166,6 +182,23 @@ def int8_gemm(q, scales, weight, groups, *, relu2=False, quant_out=False):
         "SPLITK_BLOCK_SIZE": 2048,
         "enable_fp_fusion": False,
     }
+    if fused_quant_out:
+        output_scales = torch.empty(
+            (m, triton.cdiv(n, 128)), device=q.device, dtype=torch.float32
+        )
+        output = gemm_a8w8_blockscale(
+            q,
+            weight,
+            scales,
+            groups[0],
+            dtype=torch.int8,
+            config=config,
+            backend="triton",
+            output_scales=output_scales,
+            relu2=relu2,
+            bias=bias,
+        )
+        return output, output_scales
     result = gemm_a8w8_blockscale(
         q, weight, scales, groups[0], dtype=torch.float32, config=config
     )

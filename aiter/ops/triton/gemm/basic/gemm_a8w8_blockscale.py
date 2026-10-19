@@ -51,6 +51,9 @@ def gemm_a8w8_blockscale(
     skip_reduce: bool | None = False,
     kernel_type: str = "bandwidth_bound",
     backend: str | None = None,
+    output_scales: torch.Tensor | None = None,
+    relu2: bool = False,
+    bias: torch.Tensor | None = None,
 ):
     """
     Computes 8 bit matrix multiplication Y = X @ W^T using block-wise quantization scales.
@@ -94,6 +97,24 @@ def gemm_a8w8_blockscale(
     if config is None:
         config, _ = _get_config(M, N, K, backend=backend)
 
+    if output_scales is not None or relu2 or bias is not None:
+        if backend != "triton" or config["NUM_KSPLIT"] != 1:
+            raise ValueError("Fused output epilogues require the unsplit Triton kernel")
+    if bias is not None and (
+        bias.shape != (N,) or bias.device != x.device or not bias.is_contiguous()
+    ):
+        raise ValueError("Expected a contiguous output bias")
+    if output_scales is not None:
+        if (
+            dtype != torch.int8
+            or config["BLOCK_SIZE_N"] != 128
+            or output_scales.shape != (M, triton.cdiv(N, 128))
+            or output_scales.dtype != torch.float32
+            or output_scales.device != x.device
+            or not output_scales.is_contiguous()
+        ):
+            raise ValueError("Expected contiguous FP32 GS128 output scales")
+
     if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
@@ -120,9 +141,9 @@ def gemm_a8w8_blockscale(
         triton.cdiv(N, w_scale.shape[1])
     )  # scale_block_size_n
 
-    assert (
-        config["GROUP_K"] == config["BLOCK_SIZE_K"]
-    ), "GROUP_K must equal BLOCK_SIZE_K"
+    assert config["GROUP_K"] == config["BLOCK_SIZE_K"], (
+        "GROUP_K must equal BLOCK_SIZE_K"
+    )
 
     # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
     grid = lambda META: (
@@ -142,16 +163,16 @@ def gemm_a8w8_blockscale(
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
 
     if backend == "gluon":
-        assert (
-            _is_gluon_available()
-        ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
+        assert _is_gluon_available(), (
+            f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
+        )
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a8w8_blockscale import (
             _KERNEL_MAP,
         )
 
-        assert (
-            kernel_type in _KERNEL_MAP
-        ), f"Unknown kernel_type '{kernel_type}', must be one of {list(_KERNEL_MAP.keys())}"
+        assert kernel_type in _KERNEL_MAP, (
+            f"Unknown kernel_type '{kernel_type}', must be one of {list(_KERNEL_MAP.keys())}"
+        )
         _LOGGER.info(
             f"GEMM_A8W8 BLOCKSCALE [gluon/gfx1250]: x={tuple(x.shape)} w={tuple(w.shape)} "
             f"kernel={kernel_type}"
@@ -211,6 +232,11 @@ def gemm_a8w8_blockscale(
             x_scale.stride(1),
             w_scale.stride(0),
             w_scale.stride(1),
+            output_scales=output_scales,
+            QUANT_OUT=output_scales is not None,
+            RELU2=relu2,
+            bias_ptr=bias,
+            HAS_BIAS=bias is not None,
             **config,
         )
 
@@ -354,9 +380,9 @@ def gemm_a8w8_blockscale_preshuffle(
         triton.cdiv(N, w_scale.shape[1])
     )  # scale_block_size_n
 
-    assert (
-        config["GROUP_K"] == config["BLOCK_SIZE_K"]
-    ), "GROUP_K must equal BLOCK_SIZE_K"
+    assert config["GROUP_K"] == config["BLOCK_SIZE_K"], (
+        "GROUP_K must equal BLOCK_SIZE_K"
+    )
 
     if _FORCE_GFX1250_EX:
         config["BLOCK_SIZE_K"] = 64
@@ -380,16 +406,16 @@ def gemm_a8w8_blockscale_preshuffle(
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
 
     if backend == "gluon":
-        assert (
-            _is_gluon_available()
-        ), f"Gluon preshuffle requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
+        assert _is_gluon_available(), (
+            f"Gluon preshuffle requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
+        )
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a8w8_blockscale import (
             _PRESHUFFLE_KERNEL_MAP,
         )
 
-        assert (
-            kernel_type in _PRESHUFFLE_KERNEL_MAP
-        ), f"Unknown kernel_type '{kernel_type}', must be one of {list(_PRESHUFFLE_KERNEL_MAP.keys())}"
+        assert kernel_type in _PRESHUFFLE_KERNEL_MAP, (
+            f"Unknown kernel_type '{kernel_type}', must be one of {list(_PRESHUFFLE_KERNEL_MAP.keys())}"
+        )
         _LOGGER.info(
             f"GEMM_A8W8 BLOCKSCALE PRESHUFFLE [gluon/gfx1250]: x={tuple(x.shape)} w={tuple(w.shape)} "
             f"kernel={kernel_type}"

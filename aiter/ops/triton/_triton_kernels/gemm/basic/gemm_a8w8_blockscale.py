@@ -3,6 +3,7 @@
 
 import triton
 import triton.language as tl
+import triton.language.extra.libdevice as lib
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
@@ -29,8 +30,10 @@ _gemm_a8w8_blockscale_repr = make_kernel_repr(
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
+        "GRID_MN": lambda args: (
+            triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
+            * triton.cdiv(args["N"], args["BLOCK_SIZE_N"])
+        ),
     }
 )
 @triton.jit(repr=_gemm_a8w8_blockscale_repr)
@@ -73,6 +76,11 @@ def _gemm_a8w8_blockscale_kernel(
     GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
     num_stages: tl.constexpr,
+    output_scales=None,
+    QUANT_OUT: tl.constexpr = False,
+    RELU2: tl.constexpr = False,
+    bias_ptr=None,
+    HAS_BIAS: tl.constexpr = False,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call gemm_a8w8_blockscale function
@@ -127,7 +135,6 @@ def _gemm_a8w8_blockscale_kernel(
     tl.assume(pid_k >= 0)
 
     if (pid_k * SPLITK_BLOCK_SIZE) < K:
-
         # SPLITK_BLOCK_SIZE = tl.cdiv(K, NUM_KSPLIT)
         num_k_iter = tl.cdiv(SPLITK_BLOCK_SIZE, BLOCK_SIZE_K)
         # ^ Number of K blocks within our split-K partition
@@ -157,7 +164,9 @@ def _gemm_a8w8_blockscale_kernel(
         )
         offs_ks_step = BLOCK_SIZE_K // GROUP_K
 
-        acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
+        acc_dtype = (
+            tl.float32 if QUANT_OUT or c_ptr.type.element_ty != tl.int8 else tl.int32
+        )
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
         for k in tl.range(
@@ -189,7 +198,25 @@ def _gemm_a8w8_blockscale_kernel(
             a_scale_ptrs += offs_ks_step * stride_ascale_k
             b_scale_ptrs += offs_ks_step * stride_bscale_k
 
-        c = accumulator.to(c_ptr.type.element_ty)
+        if HAS_BIAS:
+            accumulator += tl.load(bias_ptr + offs_bn)[None, :].to(tl.float32)
+        if RELU2:
+            accumulator = tl.maximum(accumulator, 0.0)
+            accumulator *= accumulator
+        if QUANT_OUT:
+            # Own a complete GS128 output group. Quantize in registers;
+            # no floating-point output tensor or post-GEMM pass.
+            tl.static_assert(BLOCK_SIZE_N == 128 and NUM_KSPLIT == 1)
+            valid_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N) < N
+            accumulator = tl.where(valid_n[None, :], accumulator, 0.0)
+            scale = tl.maximum(
+                tl.div_rn(tl.max(tl.abs(accumulator), 1), 127.0), 1.0e-30
+            )
+            c = lib.nearbyint(tl.div_rn(accumulator, scale[:, None])).to(tl.int8)
+            rows = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+            tl.store(output_scales + rows * tl.cdiv(N, 128) + pid_n, scale, rows < M)
+        else:
+            c = accumulator.to(c_ptr.type.element_ty)
 
         # Write back the block of the output matrix C with masks.
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
@@ -225,8 +252,10 @@ _gemm_a8w8_blockscale_preshuffle_repr = make_kernel_repr(
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
+        "GRID_MN": lambda args: (
+            triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
+            * triton.cdiv(args["N"], args["BLOCK_SIZE_N"])
+        ),
     }
 )
 @triton.jit(repr=_gemm_a8w8_blockscale_preshuffle_repr)
@@ -322,7 +351,6 @@ def _gemm_a8w8_blockscale_preshuffle_kernel(
     tl.assume(pid_k >= 0)
 
     if (pid_k * SPLITK_BLOCK_SIZE) < K:
-
         # SPLITK_BLOCK_SIZE = tl.cdiv(K, NUM_KSPLIT)
         num_k_iter = tl.cdiv(SPLITK_BLOCK_SIZE, BLOCK_SIZE_K)
         # ^ Number of K blocks within our split-K partition
