@@ -241,6 +241,11 @@ def int8_gemm(
             bn, warps, stages, gsm = 128, 4, 1, 1
         else:
             bm, bn, warps, stages, gsm = 128, 128, 8, 1, 1
+            prefill_cfg = os.environ.get("VLLM_GFX908_DENSE_PREFILL_CONFIG")
+            if prefill_cfg:
+                bm, bn, warps, stages, gsm = (
+                    int(v) for v in prefill_cfg.split(",")
+                )
     else:
         bm, bn, warps, stages, gsm = (
             (16, 64, 4, 1, 1)

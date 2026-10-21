@@ -2,6 +2,7 @@
 """Packed GS128 GEMMs with cached group scales and bounded dense conversion."""
 
 import importlib
+import os
 
 import torch
 import triton
@@ -289,8 +290,10 @@ def packed_experts(
     block_size=16,
     direct_int8=False,
 ):
-    if block_size not in (16, 32, 64) or (block_size != 16 and plan is None):
-        raise ValueError("Route tiles require a matching 16/32/64-row alignment plan")
+    if block_size not in (16, 32, 64, 128) or (block_size != 16 and plan is None):
+        raise ValueError(
+            "Route tiles require a matching 16/32/64/128-row alignment plan"
+        )
     m, topk = ids.shape
     routes = m * topk
     n, blocks = packed.shape[1:3]
@@ -390,9 +393,11 @@ def packed_experts(
         EXPERT_WEIGHT=None if prefill_cache is None else prefill_cache.weight,
         EXPERT_MAP=None if prefill_cache is None else prefill_cache.mapping,
         EXPERT_CACHED=prefill_cache is not None,
-        num_warps=4,
-        num_stages=1,
-        matrix_instr_nonkdim=16,
+        num_warps=int(os.environ.get("VLLM_GFX908_GROUPED_WARPS", "4")),
+        num_stages=int(os.environ.get("VLLM_GFX908_GROUPED_STAGES", "1")),
+        matrix_instr_nonkdim=int(
+            os.environ.get("VLLM_GFX908_GROUPED_NONKDIM", "16")
+        ),
         enable_fp_fusion=False,
     )
     return y if down and not direct_int8 else (y, ys)
