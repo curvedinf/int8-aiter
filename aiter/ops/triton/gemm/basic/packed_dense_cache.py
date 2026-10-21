@@ -161,22 +161,103 @@ def int8_gemm(
         raise ValueError("Expected INT8 [N,K] weights matching the activations")
     if bias is not None and not fused_quant_out:
         raise ValueError("Bias epilogue requires fused_quant_out")
-    bm, bn, warps = (
-        (16, 64, 4) if m <= 16 else (64, 64, 4) if m <= 64 else (128, 128, 8)
-    )
-    if m <= 64 and n <= 2048:
-        bm = 16
+
+    dispatch = os.environ.get("VLLM_GFX908_DENSE_DECODE_DISPATCH", "1") == "1"
+
+    # The fused epilogue forces BN=128 and KSPLIT=1, which leaves only 32-64
+    # CTAs for K=4096 projections at M<=16. Non-fused partials plus the
+    # existing GS128 reduce measured 2-3x faster on those decode shapes.
+    if dispatch and fused_quant_out and bias is None and m <= 16:
+        from aiter.ops.triton._triton_kernels.gemm.basic.gemm_packed_g128 import (
+            _split_reduce,
+        )
+
+        config = {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 1,
+            "cache_modifier": ".cg",
+            "NUM_KSPLIT": 4,
+            "SPLITK_BLOCK_SIZE": 2048,
+            "enable_fp_fusion": False,
+        }
+        if os.environ.get("VLLM_GFX908_DEBUG_SPLITK") == "1":
+            print(
+                f"SPLITK m={m} k={k} n={n} "
+                f"q={tuple(q.shape)}/{q.stride()} "
+                f"qs={tuple(scales.shape)}/{scales.stride()} "
+                f"w={tuple(weight.shape)}/{weight.stride()} "
+                f"ws={tuple(groups[0].shape)}/{groups[0].stride()} "
+                f"contig={q.is_contiguous()},{scales.is_contiguous()},"
+                f"{weight.is_contiguous()},{groups[0].is_contiguous()}",
+                flush=True,
+            )
+        partial = gemm_a8w8_blockscale(
+            q,
+            weight,
+            scales,
+            groups[0],
+            dtype=torch.float32,
+            config=config,
+            backend="triton",
+            skip_reduce=True,
+        )
+        actual_split = config["NUM_KSPLIT"]
+        output = torch.empty((m, n), device=q.device, dtype=torch.int8)
+        output_scales = torch.empty(
+            (m, triton.cdiv(n, 128)), device=q.device, dtype=torch.float32
+        )
+        _split_reduce[(m, triton.cdiv(n, 128))](
+            partial,
+            output,
+            output_scales,
+            m,
+            n,
+            actual_split,
+            relu2,
+            True,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+        if os.environ.get("VLLM_GFX908_DEBUG_SPLITK") == "1":
+            torch.cuda.synchronize()
+            print(f"SPLITK_OK m={m} k={k} n={n}", flush=True)
+        return output, output_scales
+
     if fused_quant_out:
         if not quant_out:
             raise ValueError("Fused GS128 output requires quant_out")
-        bn = 128
+        if dispatch and 17 <= m <= 32 and n > 2048:
+            bm, bn, warps, stages, gsm = 32, 128, 4, 2, 1
+        elif dispatch and 33 <= m <= 64 and n > 2048:
+            bm, bn, warps, stages, gsm = 64, 128, 8, 3, 8
+        elif m <= 16:
+            bm, bn, warps, stages, gsm = 16, 128, 4, 1, 1
+        elif m <= 64:
+            bm = 16 if n <= 2048 else 64
+            bn, warps, stages, gsm = 128, 4, 1, 1
+        else:
+            bm, bn, warps, stages, gsm = 128, 128, 8, 1, 1
+    else:
+        bm, bn, warps, stages, gsm = (
+            (16, 64, 4, 1, 1)
+            if m <= 16
+            else (64, 64, 4, 1, 1)
+            if m <= 64
+            else (128, 128, 8, 1, 1)
+        )
+        if m <= 64 and n <= 2048:
+            bm = 16
     config = {
         "BLOCK_SIZE_M": bm,
         "BLOCK_SIZE_N": bn,
         "BLOCK_SIZE_K": 128,
-        "GROUP_SIZE_M": 1,
+        "GROUP_SIZE_M": gsm,
         "num_warps": warps,
-        "num_stages": 1,
+        "num_stages": stages,
         "cache_modifier": ".cg",
         "NUM_KSPLIT": 1,
         "SPLITK_BLOCK_SIZE": 2048,

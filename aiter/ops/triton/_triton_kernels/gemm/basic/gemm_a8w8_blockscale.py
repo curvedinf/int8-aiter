@@ -169,8 +169,12 @@ def _gemm_a8w8_blockscale_kernel(
         )
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
+        # A rounded SPLITK_BLOCK_SIZE can make the last split cover K blocks
+        # beyond the scale groups; clamp so the unmasked scale loads stay in
+        # bounds (K=1344 is the Bolt shared-expert down projection).
+        k_hi = tl.minimum((pid_k + 1) * num_k_iter, tl.cdiv(K, BLOCK_SIZE_K))
         for k in tl.range(
-            pid_k * num_k_iter, (pid_k + 1) * num_k_iter, num_stages=num_stages
+            pid_k * num_k_iter, k_hi, num_stages=num_stages
         ):
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
@@ -393,7 +397,8 @@ def _gemm_a8w8_blockscale_preshuffle_kernel(
         acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
-        for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
+        k_hi = tl.minimum((pid_k + 1) * num_k_iter, tl.cdiv(K, BLOCK_SIZE_K))
+        for k in range(pid_k * num_k_iter, k_hi):
             # Load the per-K-tile block scales up-front
             a_scale = tl.load(a_scale_ptrs)
             b_scale = tl.load(b_scale_ptrs)
