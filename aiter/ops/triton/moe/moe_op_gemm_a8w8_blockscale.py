@@ -65,12 +65,11 @@ def allocate_output(
     return matmul_output, final_output
 
 
-def get_kernel_config(m, n, k, routing_data):
+def get_kernel_config(m, n, k, routing_data, blockscale_n=128):
     block_m = routing_data.block_m
     group_m = 4
     blockscale_m = 128
     blockscale_k = 128
-    blockscale_n = 128
     num_xcds = 8
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
@@ -142,6 +141,7 @@ def moe_gemm_a8w8_blockscale(
     unpadded_N=None,
     unpadded_K=None,
     per_row_x_scale=False,
+    w_blockscale_n=None,
 ):
     """
     Y[:, :] = 0.
@@ -176,7 +176,8 @@ def moe_gemm_a8w8_blockscale(
     if unpadded_K and block_m == 16:
         K = unpadded_K
     # compute optimization flags
-    config = get_kernel_config(M, N, K, routing_data)
+    config = get_kernel_config(M, N, K, routing_data,
+                               w_blockscale_n or 128)
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
         reduction_n_matmul = 1
