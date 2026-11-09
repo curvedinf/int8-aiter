@@ -142,6 +142,10 @@ def moe_gemm_a8w8_blockscale(
     unpadded_K=None,
     per_row_x_scale=False,
     w_blockscale_n=None,
+    quant_out=False,
+    residual_q=None,
+    residual_s=None,
+    down_quant_out=False,
 ):
     """
     Y[:, :] = 0.
@@ -206,6 +210,34 @@ def moe_gemm_a8w8_blockscale(
         config["block_m"],
         config["split_k"],
     )
+    if quant_out:
+        if not apply_swiglu or config["split_k"] != 1:
+            raise ValueError("quant_out requires apply_swiglu with split_k=1")
+        if config["block_n"] != 256:
+            raise ValueError(
+                f"quant_out requires the 256-column gated tile "
+                f"(m={M} n={N} k={K} block_m={config['block_m']} "
+                f"block_n={config['block_n']})")
+        if scatter_indx is not None:
+            raise ValueError("quant_out gated path has no scatter")
+        n_out = N // 2
+        yq = torch.empty((M, n_out), dtype=torch.int8, device=x.device)
+        ys = torch.empty(
+            (M, triton.cdiv(n_out, 128)), dtype=torch.float32,
+            device=x.device,
+        )
+    else:
+        yq = ys = None
+        if residual_q is not None:
+            if residual_s is None or residual_q.dtype != torch.int8:
+                raise ValueError("Invalid quantized external residual")
+            n_out = y_final.shape[-1]
+            if residual_q.shape != (y_final.shape[0], n_out):
+                raise ValueError(
+                    f"Quantized residual shape mismatch: q={tuple(residual_q.shape)} "
+                    f"s={tuple(residual_s.shape)} expect=({y_final.shape[0]},{n_out}) "
+                    f"x={tuple(x.shape)} scatter={None if scatter_indx is None else tuple(scatter_indx.shape)} "
+                    f"gather={None if gather_indx is None else tuple(gather_indx.shape)}")
     stride_bias = None if bias is None else bias.stride(0)
     # moe metadata
     expt_data = routing_data.expt_data
@@ -223,6 +255,8 @@ def moe_gemm_a8w8_blockscale(
         y.stride(0),
         y.stride(1),
         y.stride(2),
+        yq if yq is not None else y,
+        ys if ys is not None else y,
         x,
         x.stride(0),
         x.stride(1),
@@ -277,7 +311,10 @@ def moe_gemm_a8w8_blockscale(
         waves_per_eu=config["waves_per_eu"],
         matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
         kpack=config["kpack"],
+        QUANT_OUT=quant_out,
     )
+    if quant_out:
+        return yq, ys
     # Build grouped reduction inputs in a uniform way
     group_indx = (
         None
@@ -294,6 +331,9 @@ def moe_gemm_a8w8_blockscale(
         reduction_n_reduction,
         out_dtype=out_dtype,
         swiglu_add_residual=swiglu_add_residual,
+        quant_out=down_quant_out,
+        residual_q=residual_q,
+        residual_s=residual_s,
     )
     return y_final
 

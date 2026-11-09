@@ -4,6 +4,7 @@
 import torch
 import triton
 import triton.language as tl
+import triton.language.extra.libdevice as libdevice
 
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
@@ -97,6 +98,8 @@ def _moe_gemm_a8w8_blockscale(
     stride_y_k,
     stride_y_m,
     stride_y_n,
+    YQ,  # int8 codes [rows, yN] (QUANT_OUT)
+    YS,  # fp32 scales [rows, yN/128] (QUANT_OUT)
     X,
     stride_x_m,
     stride_x_k,
@@ -152,6 +155,8 @@ def _moe_gemm_a8w8_blockscale(
     UPCAST_INDICES: tl.constexpr = False,
     # Use per-row or 2D blockscale on X
     PER_ROW_X_SCALE: tl.constexpr = False,
+    # Fused gated epilogue -> per-(row,128) int8 codes + fp32 scales
+    QUANT_OUT: tl.constexpr = False,
 ):
     """
     Computes the 8 bit matmul C = A x B using the block-scale quantization approach.
@@ -345,7 +350,19 @@ def _moe_gemm_a8w8_blockscale(
             bias = tl.full([BLOCK_N], 0, dtype=tl.float32)
         acc = acc + bias[None, :]
     if APPLY_SWIGLU and SPLIT_K == 1:
-        out = _swiglu(acc, alpha, limit, ADD_RESIDUAL=SWIGLU_ADD_RESIDUAL)
+        if QUANT_OUT:
+            # Exact contract of silu_mul_quant_rn on the bf16-rounded halves:
+            # gate/up rounded once, silu in fp32 (precise exp), product
+            # rounded once, then per-128-group round-to-nearest int8.
+            g, u = tl.split(
+                tl.reshape(acc, (acc.shape[0], acc.shape[1] // 2, 2))
+            )
+            g = g.to(tl.bfloat16).to(tl.float32)
+            u = u.to(tl.bfloat16).to(tl.float32)
+            out = tl.fdiv(g, 1.0 + libdevice.exp(-g), ieee_rounding=True) * u
+            out = out.to(tl.bfloat16).to(tl.float32)
+        else:
+            out = _swiglu(acc, alpha, limit, ADD_RESIDUAL=SWIGLU_ADD_RESIDUAL)
         tl.static_assert(
             out.shape[1] == OUT_BLOCK_N,
             f"Activation fn out.shape[1] ({out.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})",
@@ -361,6 +378,34 @@ def _moe_gemm_a8w8_blockscale(
     if Gammas is not None:
         gammas = tl.load(Gammas + start_m + offs_m, mask=mask_m, other=0.0)
         out *= gammas[:, None]
+    if QUANT_OUT:
+        tl.static_assert(APPLY_SWIGLU, "QUANT_OUT requires the gated epilogue")
+        tl.static_assert(
+            OUT_BLOCK_N % 128 == 0, "QUANT_OUT requires 128-column groups"
+        )
+        groups = tl.reshape(
+            out, (out.shape[0], OUT_BLOCK_N // 128, 128)
+        )
+        sc = tl.fdiv(
+            tl.maximum(tl.max(tl.abs(groups), 2), 1.0e-8),
+            127.0,
+            ieee_rounding=True,
+        )
+        q = libdevice.llrint(
+            tl.fdiv(groups, sc[:, :, None], ieee_rounding=True)
+        )
+        q = tl.reshape(tl.minimum(tl.maximum(q, -127.0), 127.0),
+                       (out.shape[0], OUT_BLOCK_N))
+        rowq = (start_m + offs_m).to(index_type)
+        QPtrs = (
+            YQ
+            + rowq[:, None] * yN
+            + offs_y_n.to(index_type)[None, :]
+        )
+        SPtrs = YS + rowq * tl.cdiv(yN, 128) + pid_n
+        tl.store(QPtrs, q.to(tl.int8), mask=mask_m[:, None] & mask_n[None, :])
+        tl.store(SPtrs, tl.reshape(sc, (out.shape[0],)), mask=mask_m)
+        return
     # quant
     if Quant_static_scale is not None:
         out = _compute_static_fp8_quant(out, tl.load(Quant_static_scale))

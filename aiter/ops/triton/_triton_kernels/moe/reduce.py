@@ -1,5 +1,6 @@
 import triton
 import triton.language as tl
+import triton.language.extra.libdevice as libdevice
 
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 
@@ -34,6 +35,21 @@ def _reduce_grouped(
     stride_extres_m: tl.uint64,
     stride_extres_n,
     HAS_EXT_RESIDUAL: tl.constexpr,
+    # INT8 combine epilogue + quantized external residual (shared branch)
+    QOut,
+    stride_qo_m,
+    stride_qo_n,
+    SOut,
+    stride_so_m,
+    stride_so_n,
+    ResidualQ,
+    stride_rq_m,
+    stride_rq_n,
+    ResidualS,
+    stride_rs_m,
+    stride_rs_n,
+    QUANT_OUT: tl.constexpr,
+    HAS_EXT_QRESIDUAL: tl.constexpr,
 ):
     pid = tl.program_id(0)
     pid_t = pid // num_blocks
@@ -97,6 +113,55 @@ def _reduce_grouped(
             res_mask = res_offs_n < Nrem
             res = tl.load(res_ptr, mask=res_mask, other=0.0).to(tl.float32)
             acc = acc + res
+    if HAS_EXT_QRESIDUAL:
+        # Shared-expert branch stays an int8 payload: dequantize per group
+        # in-register and fold it before the combine quant.
+        res_offs_n = pid_n * BLOCK_N_OUT + tl.arange(0, BLOCK_N_OUT)
+        rq = tl.load(
+            ResidualQ + pid_t * stride_rq_m + res_offs_n * stride_rq_n
+        ).to(tl.float32)
+        s_offs = (
+            pid_n * (BLOCK_N_OUT // 128)
+            + tl.arange(0, BLOCK_N_OUT // 128)
+        )
+        rs = tl.load(ResidualS + pid_t * stride_rs_m + s_offs * stride_rs_n)
+        rs_cols = tl.reshape(
+            tl.broadcast_to(rs[:, None], (BLOCK_N_OUT // 128, 128)),
+            (BLOCK_N_OUT,),
+        )
+        acc = acc + rq * rs_cols
+    if QUANT_OUT:
+        tl.static_assert(
+            BLOCK_N_OUT % 128 == 0,
+            "INT8 combine requires whole 128-column groups per tile",
+        )
+        # The float path stores the combined row in the output dtype and the
+        # caller re-quantizes that stored value; round identically here.
+        acc = acc.to(Out.dtype.element_ty).to(tl.float32)
+        groups = tl.reshape(acc, (BLOCK_N_OUT // 128, 128))
+        sc = tl.fdiv(
+            tl.maximum(tl.max(tl.abs(groups), 1), 1.0e-8),
+            127.0,
+            ieee_rounding=True,
+        )
+        q = libdevice.llrint(
+            tl.fdiv(groups, sc[:, None], ieee_rounding=True)
+        )
+        q = tl.reshape(
+            tl.minimum(tl.maximum(q, -127.0), 127.0), (BLOCK_N_OUT,)
+        )
+        offs_n = pid_n * BLOCK_N_OUT + tl.arange(0, BLOCK_N_OUT)
+        tl.store(
+            QOut + pid_t * stride_qo_m + offs_n * stride_qo_n, q.to(tl.int8)
+        )
+        sbase = pid_n * (BLOCK_N_OUT // 128)
+        tl.store(
+            SOut
+            + pid_t * stride_so_m
+            + (sbase + tl.arange(0, BLOCK_N_OUT // 128)) * stride_so_n,
+            sc,
+        )
+        return
     # write-back for this tile
     out_ptr = OutPtrs + pid_t * stride_om
     if EVEN_N:

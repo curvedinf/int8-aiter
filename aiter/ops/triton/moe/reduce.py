@@ -27,6 +27,9 @@ def reduce_grouped(
     out_dtype=None,
     swiglu_add_residual: bool = True,
     residual: torch.Tensor | None = None,
+    quant_out: bool = False,
+    residual_q: torch.Tensor | None = None,
+    residual_s: torch.Tensor | None = None,
 ):
     """
     Grouped row reduction used during moe scatter and also compatible with split-k reduce.
@@ -73,6 +76,8 @@ def reduce_grouped(
         and x.ndim == 3
         and x.is_contiguous()
         and indx.is_contiguous()
+        and not quant_out
+        and residual_q is None
     )
     if use_gluon:
         B, M, N = x.shape[0], x.shape[1], x.shape[2]
@@ -107,6 +112,27 @@ def reduce_grouped(
 
     BLOCK_N = 512
     num_blocks = triton.cdiv(x.shape[-1], BLOCK_N)
+    if quant_out:
+        if x.shape[-1] % BLOCK_N:
+            raise ValueError("INT8 combine requires N divisible by 512")
+        q_out = torch.empty(
+            (num_groups, x.shape[-1]), dtype=torch.int8, device=x.device
+        )
+        s_out = torch.empty(
+            (num_groups, x.shape[-1] // 128),
+            dtype=torch.float32,
+            device=x.device,
+        )
+    else:
+        q_out = s_out = out
+    if residual_q is not None:
+        if (
+            residual_q.dtype != torch.int8
+            or residual_s is None
+            or residual_q.shape != (num_groups, x.shape[-1])
+            or residual_s.shape != (num_groups, x.shape[-1] // 128)
+        ):
+            raise ValueError("Invalid quantized external residual")
 
     # Step 9: prep external residual buffer + strides for the kernel.
     if residual is not None:
@@ -146,6 +172,22 @@ def reduce_grouped(
         stride_extres_m=res_stride_m,
         stride_extres_n=res_stride_n,
         HAS_EXT_RESIDUAL=has_ext_residual,
+        QOut=q_out,
+        stride_qo_m=q_out.stride(0) if quant_out else 0,
+        stride_qo_n=q_out.stride(1) if quant_out else 0,
+        SOut=s_out,
+        stride_so_m=s_out.stride(0) if quant_out else 0,
+        stride_so_n=s_out.stride(1) if quant_out else 0,
+        ResidualQ=residual_q if residual_q is not None else q_out,
+        stride_rq_m=residual_q.stride(0) if residual_q is not None else 0,
+        stride_rq_n=residual_q.stride(1) if residual_q is not None else 0,
+        ResidualS=residual_s if residual_s is not None else s_out,
+        stride_rs_m=residual_s.stride(0) if residual_s is not None else 0,
+        stride_rs_n=residual_s.stride(1) if residual_s is not None else 0,
+        QUANT_OUT=quant_out,
+        HAS_EXT_QRESIDUAL=residual_q is not None,
         num_warps=2,
     )
+    if quant_out:
+        return q_out, s_out
     return out
