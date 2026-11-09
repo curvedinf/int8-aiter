@@ -110,7 +110,15 @@ def select_2d_config(
     # pure decode config
     else:
         # to not have masking when loading KV
-        TILE_SIZE = min(64, triton.next_power_of_2(block_size))
+        _dec_tile = 64
+        if os.environ.get("AITER_UA_DECODE_TILE") is not None:
+            try:
+                _dec_tile = int(os.environ["AITER_UA_DECODE_TILE"])
+                assert _dec_tile in (16, 32, 64, 128, 256)
+            except (ValueError, AssertionError):
+                print("[aiter] ignoring invalid AITER_UA_DECODE_TILE", flush=True)
+                _dec_tile = 64
+        TILE_SIZE = min(_dec_tile, triton.next_power_of_2(block_size))
         if arch.is_rdna:
             num_stages_2d, num_warps = 1, 4
         else:
@@ -118,6 +126,14 @@ def select_2d_config(
                 num_stages_2d, num_warps = 1, 4
             else:
                 num_stages_2d, num_warps = 3, 2
+            if os.environ.get("AITER_UA_DECODE_WARPS") is not None:
+                try:
+                    _w = int(os.environ["AITER_UA_DECODE_WARPS"])
+                    _s = int(os.environ["AITER_UA_DECODE_STAGES"])
+                    assert 1 <= _w <= 16 and 1 <= _s <= 4
+                    num_warps, num_stages_2d = _w, _s
+                except (ValueError, AssertionError, KeyError):
+                    pass
         # G1 cross-path unification (AITER_UA_PIN_TILE=1): decode otherwise
         # uses TILE_SIZE 64 while prefill uses 32 (gfx908), so the softmax
         # accumulation order over KV tiles differs between decode and
