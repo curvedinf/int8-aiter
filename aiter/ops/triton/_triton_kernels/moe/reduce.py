@@ -458,7 +458,10 @@ def _routing_experts_parallel(
     for blk in range(0, 8):
         if blk < nb:
             tl.store(BlockPidMap + off_tile + blk, ((blk << 16) | pid_e))
-    scal_vals = tl.load(ExptScal + offs)
+    # Masked: offs runs to LOAD=2048 but ExptScal has only n_gates entries.
+    # Unmasked reads fault under production memory pressure (batch-8 incident
+    # root cause); the in-process allocator masked it by over-reading pool slack.
+    scal_vals = tl.load(ExptScal + offs, mask=(offs < n_gates), other=0.0)
     out_pos = off_raw + rank_cum
     tl.store(TopkIndxOut + out_pos, offs.to(tl.int32), mask=is_e)
     tl.store(GateIndxOut + offs, out_pos.to(tl.int32), mask=is_e)
