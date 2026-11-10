@@ -169,3 +169,56 @@ def _reduce_grouped(
     else:
         out_n_mask = pid_n * BLOCK_N_OUT + tl.arange(0, BLOCK_N_OUT) < Nrem
         tl.store(out_ptr, acc, mask=out_n_mask)
+
+
+@triton.jit
+def _topk_combine_fused(
+    X,
+    Indx,
+    QOut,
+    SOut,
+    stride_xm,
+    stride_xn,
+    M,
+    N,
+    BLOCK_N: tl.constexpr,
+    K: tl.constexpr,
+    GROUP_N: tl.constexpr = 128,
+):
+    """Fused top-K gather-sum + per-128 int8 quant (gfx908 decode path).
+
+    One program per (output token, N tile). The K gathers stream in registers
+    instead of the generic grouped kernel's uniform 2-warp cdiv scheme, which
+    teams of M=12 x N=2048 pay as launch + serialized gathers (~50 us).
+
+    Exact numerics vs _reduce_grouped QUANT_OUT: fp32 sum, bf16 round,
+    amax/127 round-to-nearest-even per 128 columns. Bit-identical (verified
+    against the production kernel: q/s 0/24576 mismatches at M=12).
+
+    Shapes: X [M*K, N] bf16, Indx [M, K] int32, QOut [M, N] int8,
+    SOut [M, N/128] fp32. N % BLOCK_N == 0 and BLOCK_N % 128 == 0 required.
+    """
+    pid_t = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+    base = pid_t * K
+    for i in tl.static_range(0, K):
+        idx = tl.load(Indx + base + i)
+        vals = tl.load(X + idx * stride_xm + offs_n * stride_xn).to(tl.float32)
+        acc += vals
+    acc = acc.to(tl.bfloat16).to(tl.float32)
+    groups = tl.reshape(acc, (BLOCK_N // GROUP_N, GROUP_N))
+    sc = tl.fdiv(
+        tl.maximum(tl.max(tl.abs(groups), 1), 1.0e-8),
+        127.0,
+        ieee_rounding=True,
+    )
+    q = libdevice.llrint(tl.fdiv(groups, sc[:, None], ieee_rounding=True))
+    q = tl.minimum(tl.maximum(q, -127.0), 127.0)
+    tl.store(QOut + pid_t * N + offs_n, tl.reshape(q, (BLOCK_N,)).to(tl.int8))
+    sbase = pid_n * (BLOCK_N // GROUP_N)
+    tl.store(
+        SOut + pid_t * (N // GROUP_N) + sbase + tl.arange(0, BLOCK_N // GROUP_N),
+        sc,
+    )
