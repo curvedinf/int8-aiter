@@ -455,9 +455,16 @@ def _routing_experts_parallel(
     tl.store(TokenOffsPad + pid_e, off_tile)
     h = tl.load(Hist + pid_e)
     nb = (h + BLOCK_M - 1) // BLOCK_M if h > 0 else 0
-    for blk in range(0, 8):
-        if blk < nb:
-            tl.store(BlockPidMap + off_tile + blk, ((blk << 16) | pid_e))
+    # One masked store of the expert's tile range. A fixed 8-iteration loop
+    # truncated when a single expert owned > 8*BLOCK_M gates (possible up to
+    # M*K=2048 at BLOCK_M=16, where one expert can take all 128 tiles).
+    BPM_BLKS: tl.constexpr = 128
+    blks = tl.arange(0, BPM_BLKS)
+    tl.store(
+        BlockPidMap + off_tile + blks,
+        ((blks << 16) | pid_e),
+        mask=blks < nb,
+    )
     # Masked: offs runs to LOAD=2048 but ExptScal has only n_gates entries.
     # Unmasked reads fault under production memory pressure (batch-8 incident
     # root cause); the in-process allocator masked it by over-reading pool slack.
