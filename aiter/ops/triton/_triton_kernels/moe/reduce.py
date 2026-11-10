@@ -279,9 +279,11 @@ def _offsets_sort_scatter(
     tl.store(TokenOffsRaw + N_EXPTS, n_gates)
     total_tiles = tl.sum(tiles)
     tl.store(TokenOffsPad + N_EXPTS, total_tiles)
-    # bpm: searchsorted-equivalent over tile slots.
-    for t in tl.static_range(0, 72):
-        if t < total_tiles:
+    # bpm: searchsorted-equivalent over tile slots. Bound is n_gates (= max
+    # tiles when M*K <= E); the hardcoded 72 was an M=12 assumption that
+    # broke M=16 (95 gates, tiles up to 96) and faulted the GEMM.
+    for t in tl.static_range(0, 128):
+        if t < n_gates and t < total_tiles:
             # expert = #{e: cum_t[e] <= t} - 1  (monotone cum_t)
             ok = cum_t <= t
             e_max = tl.sum(tl.where(ok, 1, 0)) - 1
@@ -314,3 +316,95 @@ def _keyed_add_two(a, b):
     ka = a & 0xFFFF0000
     kb = b & 0xFFFF0000
     return tl.where(ka == kb, a + b, b)
+
+
+# ---------------------------------------------------------------------------
+# Routing structures from topk() outputs, TWO-KERNEL production form
+# ---------------------------------------------------------------------------
+# This file section is the aiter-side counterpart of the vLLM two-kernel
+# microbench (116us). The production fast path lives behind
+# VLLM_GFX908_DIRECT_ROUTING in gptq_moe_a8w8.py and is bounded M*K<=128
+# (LOAD=128 sort). Full-M coverage needs the 2048-lane sort (28us alone,
+# measured) which lands ~164us total -- slower than production sort (128us).
+# See ledger FLINT_ROUTING_SERVING_AB_20261110 (serving rejection, M=96).
+# The kernels below are the max-M-exact implementations used by that probe:
+#   _hist_atomic: grid (cdiv(M*K,64),), atomic hist.
+#   _offsets_sort_scatter: single program, LOAD=128 lanes, may only be
+#     launched when M*K <= 128 (callers must bound).
+
+
+@triton.jit
+def _hist_atomic(ExptIndx, Hist, M, K: tl.constexpr):
+    pid = tl.program_id(0)
+    BLOCK: tl.constexpr = 64
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    n_gates = M * K
+    mask = offs < n_gates
+    e = tl.load(ExptIndx + offs, mask=mask, other=0)
+    tl.atomic_add(Hist + e, 1, mask=mask)
+
+
+@triton.jit
+def _keyed_add_two(a, b):
+    ka = a & 0xFFFF0000
+    kb = b & 0xFFFF0000
+    return tl.where(ka == kb, a + b, b)
+
+
+@triton.jit
+def _offsets_sort_scatter(
+    ExptIndx,
+    ExptScal,
+    Hist,
+    TopkIndxOut,
+    GateIndxOut,
+    GateScalOut,
+    TokenOffsRaw,
+    TokenOffsPad,
+    BlockPidMap,
+    M,
+    N_EXPTS,
+    K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    # Offsets from hist via vectorized cumsum (256 lanes).
+    hist_vec = tl.load(Hist + tl.arange(0, 256))
+    cum_raw = tl.cumsum(hist_vec, 0) - hist_vec
+    tiles = (hist_vec + BLOCK_M - 1) // BLOCK_M
+    tiles = tl.where(hist_vec > 0, tiles, 0)
+    cum_t = tl.cumsum(tiles, 0) - tiles
+    # One vector store per offset array (19us measured vs 377us per-element loop).
+    tl.store(TokenOffsRaw + tl.arange(0, 256), cum_raw)
+    tl.store(TokenOffsPad + tl.arange(0, 256), cum_t)
+    n_gates = M * K
+    tl.store(TokenOffsRaw + N_EXPTS, n_gates)
+    total_tiles = tl.sum(tiles)
+    tl.store(TokenOffsPad + N_EXPTS, total_tiles)
+    # bpm: searchsorted-equivalent over tile slots. Bound is 128 (M*K<=128
+    # callers only); hardcoded 72 was an M=12 assumption that broke M=16.
+    for t in tl.static_range(0, 128):
+        if t < n_gates and t < total_tiles:
+            ok = cum_t <= t
+            e_max = tl.sum(tl.where(ok, 1, 0)) - 1
+            tile_base = tl.sum(tl.where(tl.arange(0, 256) == e_max, cum_t, 0))
+            blk = t - tile_base
+            tl.store(BlockPidMap + t, ((blk << 16) | e_max))
+    # Sort (expert<<16)|i over 128 lanes + keyed scan.
+    LOAD: tl.constexpr = 128
+    offs = tl.arange(0, LOAD)
+    in_mask = offs < n_gates
+    raw_e = tl.load(ExptIndx + offs, mask=in_mask, other=-1)
+    expert = tl.where(in_mask & (raw_e >= 0), raw_e.to(tl.uint32), 0xFFFF)
+    kv = (expert << 16) | (offs & 0xFFFF)
+    kv = tl.sort(kv, 0)
+    sorted_e = kv >> 16
+    sorted_i = kv & 0xFFFF
+    valid = sorted_e != 0xFFFF
+    x = (kv & 0xFFFF0000 | 0x00000001)
+    scan = tl.associative_scan(x, 0, _keyed_add_two)
+    excl = (scan - 1) & 0xFFFF
+    gates = tl.load(TokenOffsRaw + sorted_e, mask=valid, other=0) + excl
+    tl.store(TopkIndxOut + gates, sorted_i.to(tl.int32), mask=valid)
+    tl.store(GateIndxOut + sorted_i, gates.to(tl.int32), mask=valid)
+    scal = tl.load(ExptScal + sorted_i, mask=valid, other=0.0)
+    tl.store(GateScalOut + gates, scal, mask=valid)
