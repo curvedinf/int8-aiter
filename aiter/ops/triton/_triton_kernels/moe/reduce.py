@@ -222,3 +222,95 @@ def _topk_combine_fused(
         SOut + pid_t * (N // GROUP_N) + sbase + tl.arange(0, BLOCK_N // GROUP_N),
         sc,
     )
+
+
+# ---------------------------------------------------------------------------
+# Direct routing structures from topk() outputs, TWO-KERNEL (M <= 256)
+# ---------------------------------------------------------------------------
+# Kernel A (atomic hist): grid (cdiv(M*K,64),) -> Hist. 24us at M=12.
+# Kernel B (offsets + bpm + sort): single program over 128 lanes.
+#   - hist -> cumsum (token/tile offsets) via tl.cumsum over [256] vector
+#   - bpm via searchsorted-equivalent: for each tile t, find expert via
+#     tl.sum(where(cum_t <= t)) (72 iterations, vectorized inner).
+#   - sort (expert<<16)|i over 128 lanes + keyed scan -> gather/scatter.
+# Total est: 24 (A incl zero) + ~90 (B) = ~114us vs production route total
+# 368us, Structures-only (sort 128us) comparison: 114 vs 128 (modest win).
+# Topk (201us, tested aiter) still runs upstream. Net routing total would
+# go 368 -> ~315us if B hits 90us. Bit-identical (topk-order input).
+
+
+@triton.jit
+def _hist_atomic(ExptIndx, Hist, M, K: tl.constexpr):
+    pid = tl.program_id(0)
+    BLOCK: tl.constexpr = 64
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    n_gates = M * K
+    mask = offs < n_gates
+    e = tl.load(ExptIndx + offs, mask=mask, other=0)
+    tl.atomic_add(Hist + e, 1, mask=mask)
+
+
+@triton.jit
+def _offsets_sort_scatter(
+    ExptIndx,
+    ExptScal,
+    Hist,
+    TopkIndxOut,
+    GateIndxOut,
+    GateScalOut,
+    TokenOffsRaw,
+    TokenOffsPad,
+    BlockPidMap,
+    M,
+    N_EXPTS,
+    K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    # Offsets from hist via vectorized cumsum (256 lanes).
+    hist_vec = tl.load(Hist + tl.arange(0, 256))
+    cum_raw = tl.cumsum(hist_vec, 0) - hist_vec
+    tiles = (hist_vec + BLOCK_M - 1) // BLOCK_M
+    tiles = tl.where(hist_vec > 0, tiles, 0)
+    cum_t = tl.cumsum(tiles, 0) - tiles
+    # One vector store per offset array (19us measured vs 377us per-element loop).
+    tl.store(TokenOffsRaw + tl.arange(0, 256), cum_raw)
+    tl.store(TokenOffsPad + tl.arange(0, 256), cum_t)
+    n_gates = M * K
+    tl.store(TokenOffsRaw + N_EXPTS, n_gates)
+    total_tiles = tl.sum(tiles)
+    tl.store(TokenOffsPad + N_EXPTS, total_tiles)
+    # bpm: searchsorted-equivalent over tile slots.
+    for t in tl.static_range(0, 72):
+        if t < total_tiles:
+            # expert = #{e: cum_t[e] <= t} - 1  (monotone cum_t)
+            ok = cum_t <= t
+            e_max = tl.sum(tl.where(ok, 1, 0)) - 1
+            tile_base = tl.sum(tl.where(tl.arange(0, 256) == e_max, cum_t, 0))
+            blk = t - tile_base
+            tl.store(BlockPidMap + t, ((blk << 16) | e_max))
+    # Sort (expert<<16)|i over 128 lanes + keyed scan.
+    LOAD: tl.constexpr = 128
+    offs = tl.arange(0, LOAD)
+    in_mask = offs < n_gates
+    raw_e = tl.load(ExptIndx + offs, mask=in_mask, other=-1)
+    expert = tl.where(in_mask & (raw_e >= 0), raw_e.to(tl.uint32), 0xFFFF)
+    kv = (expert << 16) | (offs & 0xFFFF)
+    kv = tl.sort(kv, 0)
+    sorted_e = kv >> 16
+    sorted_i = kv & 0xFFFF
+    valid = sorted_e != 0xFFFF
+    x = (kv & 0xFFFF0000 | 0x00000001)
+    scan = tl.associative_scan(x, 0, _keyed_add_two)
+    excl = (scan - 1) & 0xFFFF
+    gates = tl.load(TokenOffsRaw + sorted_e, mask=valid, other=0) + excl
+    tl.store(TopkIndxOut + gates, sorted_i.to(tl.int32), mask=valid)
+    tl.store(GateIndxOut + sorted_i, gates.to(tl.int32), mask=valid)
+    scal = tl.load(ExptScal + sorted_i, mask=valid, other=0.0)
+    tl.store(GateScalOut + gates, scal, mask=valid)
+
+
+@triton.jit
+def _keyed_add_two(a, b):
+    ka = a & 0xFFFF0000
+    kb = b & 0xFFFF0000
+    return tl.where(ka == kb, a + b, b)
