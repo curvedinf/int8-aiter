@@ -274,6 +274,10 @@ def select_3d_config(
         _seg = os.environ.get("AITER_UA_SEGMENTS")
 
         TILE_SIZE = min(64, triton.next_power_of_2(block_size))
+        _tile = os.environ.get("AITER_UA_TILE")
+        if _tile:
+            TILE_SIZE = int(_tile)
+            NUM_BLOCKS_GATHER_PER_TILE = max(1, TILE_SIZE // block_size)
 
         MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
         MIN_SEGMENTS = min(8, MAX_SEGMENTS)
@@ -302,9 +306,10 @@ def select_3d_config(
     if NUM_BLOCKS_GATHER_PER_TILE > 1:
         # force gather mode
         assert NUM_BLOCKS_GATHER_PER_TILE in [
+            2,
             4,
             8,
-        ], "Only NUM_BLOCKS_GATHER_PER_TILE = 4 or 8 is supported"
+        ], "Only NUM_BLOCKS_GATHER_PER_TILE = 2, 4 or 8 is supported"
         attn_warps = 2
         waves_per_eu = 1
         num_segments = max(1, num_segments // NUM_BLOCKS_GATHER_PER_TILE)
@@ -474,6 +479,11 @@ def unified_attention(
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
+    # Experiment lever: the verify block is num_queries_per_kv queries; the
+    # 16-row floor pads it 2x when nqpk=8 and doubles the dot work.
+    _bm = os.environ.get("AITER_UA_BLOCK_M")
+    if _bm:
+        BLOCK_M = int(_bm)
     BLOCK_Q = BLOCK_M // num_queries_per_kv
     assert BLOCK_Q >= 1
     # Ideally we would launch with kernel with:
@@ -612,6 +622,7 @@ def unified_attention(
                 K_WIDTH=K_WIDTH,
                 USE_PER_TOKEN_HEAD_SCALES=use_per_token_head_scales,
                 USE_INT8_QK_DOT=use_int8_qk_dot,
+                ABL=int(os.environ.get("AITER_UA_ABL", "0")),
                 **config,
             )
         return out
@@ -803,6 +814,8 @@ def unified_attention(
                 IS_KV_FP8=(kv_cache_dtype == e4m3_dtype),
                 USE_PER_TOKEN_HEAD_SCALES=use_per_token_head_scales,
                 USE_INT8_QK_DOT=use_int8_qk_dot,
+                ABL=int(os.environ.get("AITER_UA_ABL", "0")),
+                LOOP_STAGES=int(os.environ.get("AITER_UA_LOOPSTAGES", "1")),
                 **attn_config,
             )
 

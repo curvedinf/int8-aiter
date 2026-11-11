@@ -115,6 +115,7 @@ def kernel_unified_attention_2d(
     K_WIDTH: tl.constexpr = 0,  # int
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = False,  # bool
     USE_INT8_QK_DOT: tl.constexpr = False,  # bool
+    ABL: tl.constexpr = 0,  # diagnostic: 1=skip QK dot, 2=skip PV dot, 3=both
 ):
     kv_head_idx = tl.program_id(0)
     q_block_global_idx = tl.program_id(1)
@@ -411,7 +412,9 @@ def kernel_unified_attention_2d(
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
-        if USE_INT8_QK_DOT:
+        if ABL == 1 or ABL == 3:
+            S = tl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32)
+        elif USE_INT8_QK_DOT:
             S_int = tl.dot(Q_int8, K_int8).to(tl.float32)
             S = qk_scale * S_int * q_token_scale[:, None] * k_token_scales[None, :]
         else:
@@ -476,7 +479,10 @@ def kernel_unified_attention_2d(
         M = m_j
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc = tl.dot(P.to(V.dtype), V, acc=acc)
+        if ABL == 2 or ABL == 3:
+            acc = acc
+        else:
+            acc = tl.dot(P.to(V.dtype), V, acc=acc)
 
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
@@ -594,6 +600,8 @@ def kernel_unified_attention_3d(
     IS_KV_FP8: tl.constexpr = False,  # bool
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = False,  # bool
     USE_INT8_QK_DOT: tl.constexpr = False,  # bool
+    ABL: tl.constexpr = 0,  # diagnostic: 1=skip QK dot, 2=skip PV dot, 3=both
+    LOOP_STAGES: tl.constexpr = 1,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -747,10 +755,15 @@ def kernel_unified_attention_3d(
     if out_scale_ptr is not None:
         out_factor = out_factor / tl.load(out_scale_ptr)
 
-    # iterate through tiles within current segment
-    for j in range(
+    # iterate through tiles within current segment. Loop-level pipelining
+    # (tl.range num_stages) is separate from the kernel-level num_stages and
+    # is what overlaps the KV loads with the softmax/PV chain; measured
+    # 2026-11-11 the loads+softmax floor was 147 us against a 46 us pure-load
+    # time, i.e. the loop was not overlapping.
+    for j in tl.range(
         segm_idx * tiles_per_segment,
         min((segm_idx + 1) * tiles_per_segment, num_tiles),
+        num_stages=LOOP_STAGES,
     ):
         seq_offset = j * TILE_SIZE + offs_t
         if TILE_SIZE == BLOCK_SIZE:
@@ -884,7 +897,9 @@ def kernel_unified_attention_3d(
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
-        if USE_INT8_QK_DOT:
+        if ABL == 1 or ABL == 3:
+            S = tl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32)
+        elif USE_INT8_QK_DOT:
             S_int = tl.dot(Q_int8, K_int8).to(tl.float32)
             S = qk_scale * S_int * q_token_scale[:, None] * k_token_scales[None, :]
         else:
@@ -948,7 +963,10 @@ def kernel_unified_attention_3d(
         M = m_j
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc = tl.dot(P.to(V.dtype), V, acc=acc)
+        if ABL == 2 or ABL == 3:
+            acc = acc
+        else:
+            acc = tl.dot(P.to(V.dtype), V, acc=acc)
 
     acc = acc * out_factor
     if NUM_SEGMENTS_PER_SEQ == 1:
