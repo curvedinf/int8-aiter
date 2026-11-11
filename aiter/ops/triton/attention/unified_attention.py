@@ -479,6 +479,13 @@ def unified_attention(
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
+    # gfx908 int8 decode verify: pack four verify positions into one M tile
+    # (4 x 8 q heads = 32 rows) so each KV segment is streamed once per four
+    # positions instead of once per two. Microbench, 16k context, kvh1:
+    # BLOCK_M 16 -> 506.8 us/layer, 32 -> 393.8, 64 -> 442.1 (the PV
+    # accumulator at 64 is 128 f32/lane and spills).
+    if DEVICE_ARCH == "gfx908" and max_seqlen_q <= 16 and num_queries_per_kv == 8:
+        BLOCK_M = 32
     # Experiment lever: the verify block is num_queries_per_kv queries; the
     # 16-row floor pads it 2x when nqpk=8 and doubles the dot work.
     _bm = os.environ.get("AITER_UA_BLOCK_M")
