@@ -127,3 +127,133 @@ def native_sites() -> set:
 
 def native_enabled(site: str) -> bool:
     return site in native_sites()
+
+
+@functools.lru_cache(maxsize=1)
+def _hadamard_module():
+    module = ctypes.CDLL(str(_build("head_hadamard_bf16_gfx908.hip")))
+    fn = module.launch_head_hadamard
+    fn.argtypes = [ctypes.c_void_p] * 5
+    fn.restype = ctypes.c_int
+    return fn
+
+
+def head_hadamard_supported(x: torch.Tensor) -> bool:
+    return (
+        _arch() == "gfx908"
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and x.shape[-1] % 64 == 0
+        and x.is_contiguous()
+    )
+
+
+def head_hadamard(x: torch.Tensor, out: torch.Tensor | None = None):
+    """Normalized 64-point Hadamard over the last dim; self-inverse.
+
+    Returns a new tensor when ``out`` is None, else writes into ``out``
+    (which may alias ``x``). Falls back to None when unsupported.
+    """
+    if not head_hadamard_supported(x):
+        return None
+    dst = torch.empty_like(x) if out is None else out
+    status = _hadamard_module()(
+        x.data_ptr(),
+        dst.data_ptr(),
+        x.numel() // x.shape[-1],
+        x.shape[-1],
+        torch.cuda.current_stream().cuda_stream,
+    )
+    if status != 0:
+        raise RuntimeError(f"head hadamard launch failed: hip status {status}")
+    return dst
+
+
+@functools.lru_cache(maxsize=1)
+def _attn_module():
+    module = ctypes.CDLL(str(_build("paged_attn_decode_int8_pthead_gfx908.hip")))
+    pack = module.launch_pack_q
+    pack.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_int64, ctypes.c_void_p]
+    pack.restype = ctypes.c_int
+    attn = module.launch_paged_attn_decode_int8
+    attn.argtypes = (
+        [ctypes.c_void_p] * 12
+        + [ctypes.c_int] * 7
+        + [ctypes.c_int64] * 12
+        + [ctypes.c_float, ctypes.c_void_p]
+    )
+    attn.restype = ctypes.c_int
+    red = module.launch_reduce_segments
+    red.argtypes = (
+        [ctypes.c_void_p] * 4 + [ctypes.c_int64] + [ctypes.c_int] * 3
+        + [ctypes.c_void_p]
+    )
+    red.restype = ctypes.c_int
+    return pack, attn, red
+
+
+def paged_attn_decode_int8(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    out: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    max_seqlen_q: int,
+    seqused_k: torch.Tensor,
+    block_table: torch.Tensor,
+    k_scale_cache: torch.Tensor,
+    v_scale_cache: torch.Tensor,
+    softmax_scale: float,
+    num_segments: int = 8,
+) -> None:
+    """Paged int8 decode attention for gfx908 (int8 per-token-head cache).
+
+    ``q`` is bf16 [tokens, q_heads, dim] (already Hadamard-rotated by the
+    caller when rotation is on); K/V are int8 with per-(token, head) fp32
+    scales. Writes bf16 into ``out`` (same shape as ``q``).
+    """
+    assert q.dtype == torch.bfloat16 and out.dtype == torch.bfloat16
+    assert k_cache.dtype == torch.int8 and v_cache.dtype == torch.int8
+    assert max_seqlen_q <= 8, "native kernel covers verify blocks up to 8"
+    num_tokens, num_q_heads, dim = q.shape
+    num_blocks, block_size, num_kv_heads, _ = k_cache.shape
+    qg = num_q_heads // num_kv_heads
+    rows = num_tokens * num_q_heads
+    dev = q.device
+
+    q8 = torch.empty((rows, dim), dtype=torch.int8, device=dev)
+    qsc = torch.empty((rows,), dtype=torch.float32, device=dev)
+    pack, attn, red = _attn_module()
+    stream = torch.cuda.current_stream().cuda_stream
+    status = pack(q.data_ptr(), q8.data_ptr(), qsc.data_ptr(), rows, stream)
+    if status != 0:
+        raise RuntimeError(f"pack_q failed: {status}")
+
+    seg_out = torch.empty((rows, num_segments, dim), dtype=torch.float32, device=dev)
+    seg_m = torch.empty((rows, num_segments), dtype=torch.float32, device=dev)
+    seg_l = torch.empty_like(seg_m)
+
+    kb, ks, kv = k_cache.stride(0), k_cache.stride(1), k_cache.stride(2)
+    vb, vs, vv = v_cache.stride(0), v_cache.stride(1), v_cache.stride(2)
+    ksc_b, ksc_s, ksc_h = k_scale_cache.stride()
+    vsc_b, vsc_s, vsc_h = v_scale_cache.stride()
+    status = attn(
+        q8.data_ptr(), qsc.data_ptr(),
+        k_cache.data_ptr(), v_cache.data_ptr(),
+        k_scale_cache.data_ptr(), v_scale_cache.data_ptr(),
+        block_table.data_ptr(), seqused_k.data_ptr(), cu_seqlens_q.data_ptr(),
+        seg_out.data_ptr(), seg_m.data_ptr(), seg_l.data_ptr(),
+        cu_seqlens_q.numel() - 1, num_segments, num_kv_heads, num_q_heads, qg,
+        block_size, block_table.shape[1],
+        kb, ks, kv, vb, vs, vv,
+        ksc_b, ksc_s, ksc_h, vsc_b, vsc_s, vsc_h,
+        float(softmax_scale), stream,
+    )
+    if status != 0:
+        raise RuntimeError(f"paged_attn_decode_int8 failed: {status}")
+    status = red(
+        seg_out.data_ptr(), seg_m.data_ptr(), seg_l.data_ptr(), out.data_ptr(),
+        rows, cu_seqlens_q.numel() - 1, num_q_heads, num_segments, stream,
+    )
+    if status != 0:
+        raise RuntimeError(f"reduce_segments failed: {status}")

@@ -1,5 +1,6 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
+import inspect
 import math
 import os
 
@@ -37,6 +38,13 @@ except:  # noqa: E722
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
+
+from aiter.ops.kv_rotation import (
+    BLOCK as _ROT_BLOCK,
+    enabled as _rot_enabled,
+    inverse_ as _rot_inverse,
+    rotate as _rot_forward,
+)
 
 # Max NUM_SEGMENTS the gluon reduce holds in-thread; larger split counts fall back to the Triton reduce_segments.
 _GLUON_REDUCE_MAX_SEGMENTS = 8
@@ -382,7 +390,7 @@ def use_2d_kernel(
     )
 
 
-def unified_attention(
+def _unified_attention_impl(
     q,
     k,
     v,
@@ -1069,3 +1077,57 @@ def _gfx1250_unified_attention_2d(
         NUM_BUFFERS=num_buffers,
         LOOP_VARIANT=loop_variant,
     )
+
+
+# Public entry. Wraps the implementation so the int8 per-token-head KV
+# Hadamard rotation (llama.cpp #21038) is applied exactly once around every
+# attention call: Q rotated and softmax_scale divided by the block size on the
+# way in, the output un-rotated on the way out. The cache writer rotates K/V
+# with the same matrix, so scores are unchanged and the quantized cache is
+# smoother. Gated to int8 per-token-head caches (k_scale_cache present).
+_PARAM_NAMES = list(inspect.signature(_unified_attention_impl).parameters)
+
+
+def _rot_arg(args, kwargs, name):
+    i = _PARAM_NAMES.index(name)
+    return args[i] if i < len(args) else kwargs.get(name)
+
+
+def _rot_override(args, kwargs, values):
+    args = list(args)
+    for name, val in values.items():
+        i = _PARAM_NAMES.index(name)
+        if i < len(args):
+            args[i] = val
+        else:
+            kwargs[name] = val
+    return args, kwargs
+
+
+def unified_attention(*args, **kwargs):
+    q = _rot_arg(args, kwargs, "q")
+    k = _rot_arg(args, kwargs, "k")
+    out = _rot_arg(args, kwargs, "out")
+    scale = _rot_arg(args, kwargs, "softmax_scale")
+    k_scale_cache = _rot_arg(args, kwargs, "k_scale_cache")
+    rot = (
+        q is not None
+        and out is not None
+        and scale is not None
+        and getattr(k, "dtype", None) == torch.int8
+        and k_scale_cache is not None
+        and q.shape[-1] % _ROT_BLOCK == 0
+        and _rot_enabled(q.shape[-1])
+    )
+    if rot:
+        args, kwargs = _rot_override(
+            args,
+            kwargs,
+            {"q": _rot_forward(q)},
+        )
+    result = _unified_attention_impl(*args, **kwargs)
+    # Tuple returns leave `out` to a later reduce (segmented/g8 path only,
+    # never int8 per-token-head); only the final output is un-rotated.
+    if rot and not isinstance(result, tuple):
+        _rot_inverse(out)
+    return result
