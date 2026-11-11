@@ -177,7 +177,7 @@ def _attn_module():
     pack.restype = ctypes.c_int
     attn = module.launch_paged_attn_decode_int8
     attn.argtypes = (
-        [ctypes.c_void_p] * 12
+        [ctypes.c_void_p] * 13
         + [ctypes.c_int] * 7
         + [ctypes.c_int64] * 12
         + [ctypes.c_float, ctypes.c_void_p]
@@ -205,6 +205,7 @@ def paged_attn_decode_int8(
     v_scale_cache: torch.Tensor,
     softmax_scale: float,
     num_segments: int = 8,
+    sinks: torch.Tensor | None = None,
 ) -> None:
     """Paged int8 decode attention for gfx908 (int8 per-token-head cache).
 
@@ -242,12 +243,15 @@ def paged_attn_decode_int8(
         k_cache.data_ptr(), v_cache.data_ptr(),
         k_scale_cache.data_ptr(), v_scale_cache.data_ptr(),
         block_table.data_ptr(), seqused_k.data_ptr(), cu_seqlens_q.data_ptr(),
+        0 if sinks is None else sinks.data_ptr(),
         seg_out.data_ptr(), seg_m.data_ptr(), seg_l.data_ptr(),
         cu_seqlens_q.numel() - 1, num_segments, num_kv_heads, num_q_heads, qg,
         block_size, block_table.shape[1],
         kb, ks, kv, vb, vs, vv,
         ksc_b, ksc_s, ksc_h, vsc_b, vsc_s, vsc_h,
-        float(softmax_scale), stream,
+        # The kernel's softmax is exp2-based, so the scale carries log2(e)
+        # (same convention as the Triton UA kernel).
+        float(softmax_scale) * 1.4426950408889634, stream,
     )
     if status != 0:
         raise RuntimeError(f"paged_attn_decode_int8 failed: {status}")

@@ -494,6 +494,47 @@ def _unified_attention_impl(
     # accumulator at 64 is 128 f32/lane and spills).
     if DEVICE_ARCH == "gfx908" and max_seqlen_q <= 16 and num_queries_per_kv == 8:
         BLOCK_M = 32
+    # Native gfx908 int8 decode path (docs/design/int8_small_gemm_native.md,
+    # stage 1). Fires only for the exact contract the HIP kernel implements:
+    # gfx908, int8 per-token-head cache, head_dim 128, causal, verify block
+    # <= 8, GQA 8 or 4. Everything else falls through to the Triton kernels.
+    if (
+        max_seqlen_q <= 8
+        and window_size[0] < 0  # native kernel has no sliding window
+        and softcap == 0
+        and alibi_slopes is None
+        and qq_bias is None
+        and output_scale is None
+        and num_queries_per_kv in (4, 8)
+        and head_size == 128
+        and kv_cache_dtype == torch.int8
+        and k_scale_cache is not None
+        and v_scale_cache is not None
+        and q.dtype == torch.bfloat16
+        and q.is_contiguous()
+        and out.is_contiguous()
+    ):
+        from aiter.ops import int8_native as _i8n
+
+        if _i8n.native_enabled("ua_decode") and not _BYPASS_NATIVE:
+            if os.environ.get("INT8_ATTN_TRACE") == "1":
+                _key = (tuple(q.shape), num_queries_per_kv, max_seqlen_q,
+                        max_seqlen_k // 512, window_size[0], sinks is not None)
+                if _key not in _NATIVE_TRACE:
+                    _NATIVE_TRACE.add(_key)
+                    print(f"[int8-native] q={tuple(q.shape)} qg={num_queries_per_kv} "
+                          f"maxq={max_seqlen_q} maxk={max_seqlen_k} "
+                          f"win={window_size[0]} sinks={sinks is not None}",
+                          flush=True)
+            _seg = 8 if max_seqlen_k <= 4096 else 16
+            _seg = min(_seg, max(1, (max_seqlen_k + 63) // 64))
+            _i8n.paged_attn_decode_int8(
+                q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k,
+                block_table, k_scale_cache, v_scale_cache, softmax_scale,
+                num_segments=_seg, sinks=sinks,
+            )
+            return out
+
     # Experiment lever: the verify block is num_queries_per_kv queries; the
     # 16-row floor pads it 2x when nqpk=8 and doubles the dot work.
     _bm = os.environ.get("AITER_UA_BLOCK_M")
@@ -1086,6 +1127,8 @@ def _gfx1250_unified_attention_2d(
 # with the same matrix, so scores are unchanged and the quantized cache is
 # smoother. Gated to int8 per-token-head caches (k_scale_cache present).
 _PARAM_NAMES = list(inspect.signature(_unified_attention_impl).parameters)
+_NATIVE_TRACE: set = set()
+_BYPASS_NATIVE = False
 
 
 def _rot_arg(args, kwargs, name):
@@ -1125,7 +1168,70 @@ def unified_attention(*args, **kwargs):
             kwargs,
             {"q": _rot_forward(q)},
         )
+    _cmp = (
+        os.environ.get("INT8_ATTN_COMPARE") == "1"
+        and not _BYPASS_NATIVE
+        and _rot_arg(args, kwargs, "max_seqlen_q") is not None
+        and _rot_arg(args, kwargs, "max_seqlen_q") <= 8
+        and getattr(_rot_arg(args, kwargs, "k"), "dtype", None) == torch.int8
+        and _rot_arg(args, kwargs, "k_scale_cache") is not None
+    )
+    _cmp_ref = None
+    if _cmp:
+        _cmp_ref = torch.empty_like(out)
+        _ref_args, _ref_kwargs = _rot_override(
+            args, kwargs, {"out": _cmp_ref}
+        )
+        globals()["_BYPASS_NATIVE"] = True
+        try:
+            _unified_attention_impl(*_ref_args, **_ref_kwargs)
+        finally:
+            globals()["_BYPASS_NATIVE"] = False
     result = _unified_attention_impl(*args, **kwargs)
+    if _cmp and not isinstance(result, tuple):
+        d = (_cmp_ref.float() - out.float()).abs()
+        print(f"[int8-cmp] q={tuple(q.shape)} max={d.max().item():.4g} "
+              f"mean={d.mean().item():.4g} ref_norm={_cmp_ref.float().norm().item():.4g} "
+              f"nat_norm={out.float().norm().item():.4g}", flush=True)
+        if not torch.cuda.is_current_stream_capturing():
+            from aiter.ops import int8_native as _i8n
+            _k = _rot_arg(args, kwargs, "k")
+            _v = _rot_arg(args, kwargs, "v")
+            _cu = _rot_arg(args, kwargs, "cu_seqlens_q")
+            _sk = _rot_arg(args, kwargs, "seqused_k")
+            _bt = _rot_arg(args, kwargs, "block_table")
+            _ksc = _rot_arg(args, kwargs, "k_scale_cache")
+            _vsc = _rot_arg(args, kwargs, "v_scale_cache")
+            _sc = _rot_arg(args, kwargs, "softmax_scale")
+            _dump = os.environ.get("INT8_ATTN_DUMP")
+            if _dump and not os.path.exists(_dump):
+                torch.save({
+                    "q": q.detach().cpu(), "k": _k.detach().cpu(),
+                    "v": _v.detach().cpu(), "cu": _cu.detach().cpu(),
+                    "sk": _sk.detach().cpu(), "bt": _bt.detach().cpu(),
+                    "ksc": _ksc.detach().cpu(), "vsc": _vsc.detach().cpu(),
+                    "sinks": None if sinks is None else sinks.detach().cpu(),
+                    "out_ref": _cmp_ref.detach().cpu(),
+                    "out_nat": out.detach().cpu(),
+                    "scale": _sc,
+                }, _dump)
+                print(f"[int8-dump] wrote {_dump}", flush=True)
+            print(f"[int8-dbg] cu={_cu[:4].tolist()} sk={_sk[:4].tolist()} "
+                  f"bt={_bt[0,:4].tolist()} dt={_cu.dtype},{_sk.dtype},{_bt.dtype} "
+                  f"pre_norm={out.float().norm().item():.4g} "
+                  f"qsc_head={float(q.float()[0].abs().max()):.4g}", flush=True)
+            for _s in (1, 2, 4, 8, 16):
+                _tmp = torch.empty_like(out)
+                try:
+                    _i8n.paged_attn_decode_int8(q, _k, _v, _tmp, _cu,
+                        _rot_arg(args, kwargs, "max_seqlen_q"), _sk, _bt,
+                        _ksc, _vsc, _sc, num_segments=_s, sinks=_rot_arg(args, kwargs, "sinks"))
+                    _d = (_cmp_ref.float() - _tmp.float()).abs()
+                    print(f"[int8-seg] seg={_s} max={_d.max().item():.4g} "
+                          f"mean={_d.mean().item():.4g} norm={_tmp.float().norm().item():.4g}",
+                          flush=True)
+                except Exception as _e:
+                    print(f"[int8-seg] seg={_s} FAIL {_e}", flush=True)
     # Tuple returns leave `out` to a later reduce (segmented/g8 path only,
     # never int8 per-token-head); only the final output is un-rotated.
     if rot and not isinstance(result, tuple):

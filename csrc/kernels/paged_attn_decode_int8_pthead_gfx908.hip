@@ -25,6 +25,7 @@
 #include <hip/hip_bfloat16.h>
 
 #include <cstdlib>
+#include <cstdio>
 
 static int getenv_int(const char* k, int d) {
   const char* v = getenv(k);
@@ -74,7 +75,7 @@ paged_attn_decode_int8_kernel(
     const signed char* __restrict__ v_cache,
     const float* __restrict__ k_scale, const float* __restrict__ v_scale,
     const int* __restrict__ block_table, const int* __restrict__ seqused_k,
-    const int* __restrict__ cu_q,
+    const int* __restrict__ cu_q, const float* __restrict__ sinks,
     float* __restrict__ seg_out, float* __restrict__ seg_m,
     float* __restrict__ seg_l,
     int num_q_heads, int block_size, int max_blocks,
@@ -82,7 +83,7 @@ paged_attn_decode_int8_kernel(
     int64_t vb_stride, int64_t vs_stride, int64_t vv_stride,
     int64_t ksc_b, int64_t ksc_s, int64_t ksc_h,
     int64_t vsc_b, int64_t vsc_s, int64_t vsc_h,
-    float qk_scale) {
+    float qk_scale, int kdbg) {
   extern __shared__ __attribute__((aligned(16))) char smem[];
   signed char* k_lds = reinterpret_cast<signed char*>(smem);
   signed char* v_lds = k_lds + TILE_TOK * KSTRIDE;
@@ -98,6 +99,11 @@ paged_attn_decode_int8_kernel(
   const int q_len = cu_q[seq + 1] - cu_q[seq];
   const int seq_len = seqused_k[seq];
   const int ctx_len = seq_len - q_len;
+  if (kdbg && threadIdx.x == 0 && blockIdx.z == 0)
+    printf("[kdbg] blk=(%d,%d) q_len=%d seq_len=%d tiles=%d per_seg=%d\n",
+           blockIdx.x, blockIdx.y, q_len, seq_len,
+           (seq_len + TILE_TOK - 1) / TILE_TOK,
+           ((seq_len + TILE_TOK - 1) / TILE_TOK + gridDim.y - 1) / gridDim.y);
   if (q_len <= 0 || seq_len <= 0) return;
 
   const int row0 = cu_q[seq];
@@ -107,7 +113,6 @@ paged_attn_decode_int8_kernel(
   const int tiles_per_seg = (num_tiles + gridDim.y - 1) / gridDim.y;
   const int tile_lo = seg * tiles_per_seg;
   const int tile_hi = min(tile_lo + tiles_per_seg, num_tiles);
-  if (tile_lo >= tile_hi) return;
 
   // ---- per-lane query columns -------------------------------------------
   const int col = lane & 15;             // query within an N tile
@@ -135,12 +140,39 @@ paged_attn_decode_int8_kernel(
     }
   }
 
+  // Segments past the last tile must still publish neutral partials: the
+  // reduce reads every segment, and uninitialized buffers hold stale data.
+  if (tile_lo >= tile_hi) {
+    #pragma unroll
+    for (int n = 0; n < NT; ++n) {
+      if (qi[n] >= q_len) continue;
+      const int64_t base = ((int64_t)qrow[n] * num_q_heads + qhead[n])
+                           * gridDim.y + seg;
+      #pragma unroll
+      for (int d = 0; d < 8; ++d)
+        #pragma unroll
+        for (int v = 0; v < 4; ++v)
+          seg_out[base * HDIM + d * 16 + quad * 4 + v] = 0.0f;
+      if (quad == 0) {
+        seg_m[base] = NEG_BIG;
+        seg_l[base] = 0.0f;
+      }
+    }
+    return;
+  }
+
   float m_run[NT], l_run[NT];
   float acc[8][NT][4];
   #pragma unroll
   for (int n = 0; n < NT; ++n) {
-    m_run[n] = NEG_BIG;
-    l_run[n] = 0.0f;
+    // Learned attention sink: a per-head logit that enters only the softmax
+    // denominator. Triton seeds segment 0 with M = sink * log2(e) and L = 1,
+    // which is exactly exp2(sink*log2e - M) at the running max; later
+    // segments start empty (their L=1 is zeroed by the first rescale).
+    const float sv = (sinks != nullptr && seg == 0)
+        ? sinks[qhead[n]] * 1.4426950408889634f : 0.0f;
+    m_run[n] = (sinks != nullptr && seg == 0) ? sv : NEG_BIG;
+    l_run[n] = (sinks != nullptr && seg == 0) ? 1.0f : 0.0f;
   }
   #pragma unroll
   for (int d = 0; d < 8; ++d)
@@ -386,7 +418,7 @@ extern "C" int launch_paged_attn_decode_int8(
     const void* q8, const void* q_scale, const void* k_cache,
     const void* v_cache, const void* k_scale, const void* v_scale,
     const void* block_table, const void* seqused_k, const void* cu_q,
-    void* seg_out, void* seg_m, void* seg_l,
+    const void* sinks, void* seg_out, void* seg_m, void* seg_l,
     int num_seqs, int num_segments, int num_kv_heads, int num_q_heads,
     int qg, int block_size, int max_blocks,
     int64_t kb_stride, int64_t ks_stride, int64_t kv_stride,
@@ -397,6 +429,11 @@ extern "C" int launch_paged_attn_decode_int8(
   dim3 grid(num_seqs, num_segments, num_kv_heads);
   const int smem = SMEM_BYTES;
   const int nt = qg == 8 ? (int)getenv_int("INT8_ATTN_NT", 2) : 1;
+  const int kdbg = getenv("INT8_ATTN_KDBG") != nullptr ? 1 : 0;
+  if (getenv("INT8_ATTN_DEBUG")) {
+    fprintf(stderr, "[int8attn] qg=%d nt=%d grid=(%d,%d,%d) smem=%d\n",
+            qg, nt, num_seqs, num_segments, num_kv_heads, smem);
+  }
   if (qg == 8 && nt == 1) {
     constexpr int waves = (8 * 8) / 16;
     paged_attn_decode_int8_kernel<8, 8, 1><<<grid, waves * 64, smem,
@@ -405,10 +442,11 @@ extern "C" int launch_paged_attn_decode_int8(
         (const signed char*)k_cache, (const signed char*)v_cache,
         (const float*)k_scale, (const float*)v_scale,
         (const int*)block_table, (const int*)seqused_k, (const int*)cu_q,
-        (float*)seg_out, (float*)seg_m, (float*)seg_l, num_q_heads,
+        (const float*)sinks, (float*)seg_out, (float*)seg_m, (float*)seg_l,
+        num_q_heads,
         block_size, max_blocks, kb_stride, ks_stride, kv_stride, vb_stride,
         vs_stride, vv_stride, ksc_b, ksc_s, ksc_h, vsc_b, vsc_s, vsc_h,
-        qk_scale);
+        qk_scale, kdbg);
   } else if (qg == 8) {
     constexpr int waves = (8 * 8) / 32;
     paged_attn_decode_int8_kernel<8, 8, 2><<<grid, waves * 64, smem,
@@ -417,10 +455,11 @@ extern "C" int launch_paged_attn_decode_int8(
         (const signed char*)k_cache, (const signed char*)v_cache,
         (const float*)k_scale, (const float*)v_scale,
         (const int*)block_table, (const int*)seqused_k, (const int*)cu_q,
-        (float*)seg_out, (float*)seg_m, (float*)seg_l, num_q_heads,
+        (const float*)sinks, (float*)seg_out, (float*)seg_m, (float*)seg_l,
+        num_q_heads,
         block_size, max_blocks, kb_stride, ks_stride, kv_stride, vb_stride,
         vs_stride, vv_stride, ksc_b, ksc_s, ksc_h, vsc_b, vsc_s, vsc_h,
-        qk_scale);
+        qk_scale, kdbg);
   } else if (qg == 4) {
     constexpr int waves = (8 * 4) / 16;
     paged_attn_decode_int8_kernel<4, 8, 1><<<grid, waves * 64, smem,
@@ -429,10 +468,11 @@ extern "C" int launch_paged_attn_decode_int8(
         (const signed char*)k_cache, (const signed char*)v_cache,
         (const float*)k_scale, (const float*)v_scale,
         (const int*)block_table, (const int*)seqused_k, (const int*)cu_q,
-        (float*)seg_out, (float*)seg_m, (float*)seg_l, num_q_heads,
+        (const float*)sinks, (float*)seg_out, (float*)seg_m, (float*)seg_l,
+        num_q_heads,
         block_size, max_blocks, kb_stride, ks_stride, kv_stride, vb_stride,
         vs_stride, vv_stride, ksc_b, ksc_s, ksc_h, vsc_b, vsc_s, vsc_h,
-        qk_scale);
+        qk_scale, kdbg);
   } else {
     return -2;
   }
