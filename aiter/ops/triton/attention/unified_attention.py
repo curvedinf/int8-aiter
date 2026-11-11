@@ -256,8 +256,22 @@ def select_3d_config(
             waves_per_eu = 1
             attn_warps = 4
             attn_stages = 1
+            # Experiment levers for the long-KV decode path (defaults keep
+            # the measured short-context tuning).
+            _w = os.environ.get("AITER_UA_3D_WARPS")
+            _st = os.environ.get("AITER_UA_3D_STAGES")
+            if _w:
+                attn_warps = int(_w)
+            if _st:
+                attn_stages = int(_st)
         occ = waves_per_eu * 4 // attn_warps
         target_num_prgms = target_num_prgms * occ
+        # Experiment lever: force the KV segment count for decode. The
+        # heuristic below can leave the decode grid at a handful of CTAs at
+        # long context (measured 2026-11-11: 881 us/layer at 16k, 12 seqs,
+        # ~0.5% of peak); this lets the segment count be swept without a
+        # rebuild of the heuristic.
+        _seg = os.environ.get("AITER_UA_SEGMENTS")
 
         TILE_SIZE = min(64, triton.next_power_of_2(block_size))
 
@@ -270,6 +284,8 @@ def select_3d_config(
             num_segments = min(num_segments, MAX_SEGMENTS)
             num_segments = max(num_segments, MIN_SEGMENTS)
             num_segments = triton.next_power_of_2(num_segments)
+        if _seg:
+            num_segments = max(1, min(int(_seg), MAX_SEGMENTS))
 
         if num_segments == MIN_SEGMENTS:
             reduce_num_warps = 1
@@ -614,6 +630,18 @@ def unified_attention(
             NUM_BLOCKS_GATHER_PER_TILE,
             SLIDING_WINDOW,
         )
+        # gfx908 decode tuning (measured 2026-11-11, 12 seqs x 8 q):
+        # warps=2 / stages=2 / 8 segments is 1.8x faster than the previous
+        # warps=4 / stages=1 / heuristic-segments geometry at 16k context
+        # (487 vs 881 us/layer) and 1.5x at 2k (74 vs 109), and 1.6-2.1x
+        # faster than bf16 KV on the same kernel. Decode-only: prefill keeps
+        # its own tuning. Env levers keep the sweep reproducible.
+        if DEVICE_ARCH == "gfx908" and max_seqlen_q <= 16:
+            _seg = int(os.environ.get("AITER_UA_SEGMENTS", "8"))
+            attn_config["NUM_SEGMENTS_PER_SEQ"] = _seg
+            reduce_config["NUM_SEGMENTS_PER_SEQ"] = _seg
+            attn_config["num_warps"] = int(os.environ.get("AITER_UA_3D_WARPS", "2"))
+            attn_config["num_stages"] = int(os.environ.get("AITER_UA_3D_STAGES", "2"))
         NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
         if NUM_SEGMENTS > 1:
             segm_output = torch.empty(
