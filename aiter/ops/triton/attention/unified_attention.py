@@ -1138,6 +1138,7 @@ def _rot_arg(args, kwargs, name):
 
 def _rot_override(args, kwargs, values):
     args = list(args)
+    kwargs = dict(kwargs)   # never mutate the caller's dict (compare harness)
     for name, val in values.items():
         i = _PARAM_NAMES.index(name)
         if i < len(args):
@@ -1205,12 +1206,14 @@ def unified_attention(*args, **kwargs):
             _sc = _rot_arg(args, kwargs, "softmax_scale")
             _dump = os.environ.get("INT8_ATTN_DUMP")
             if _dump and not os.path.exists(_dump):
+                _snk = _rot_arg(args, kwargs, "sinks")
+                _bmax = int(_bt.max().item()) + 1
                 torch.save({
-                    "q": q.detach().cpu(), "k": _k.detach().cpu(),
-                    "v": _v.detach().cpu(), "cu": _cu.detach().cpu(),
+                    "q": q.detach().cpu(), "k": _k[:_bmax].detach().cpu(),
+                    "v": _v[:_bmax].detach().cpu(), "cu": _cu.detach().cpu(),
                     "sk": _sk.detach().cpu(), "bt": _bt.detach().cpu(),
-                    "ksc": _ksc.detach().cpu(), "vsc": _vsc.detach().cpu(),
-                    "sinks": None if sinks is None else sinks.detach().cpu(),
+                    "ksc": _ksc[:_bmax].detach().cpu(), "vsc": _vsc[:_bmax].detach().cpu(),
+                    "sinks": None if _snk is None else _snk.detach().cpu(),
                     "out_ref": _cmp_ref.detach().cpu(),
                     "out_nat": out.detach().cpu(),
                     "scale": _sc,

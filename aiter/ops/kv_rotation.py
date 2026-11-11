@@ -11,9 +11,12 @@ H is the normalized Sylvester matrix over 64-wide blocks of the head dim.
 Block size 64 is deliberate: upstream's follow-up found smaller matrices
 quantize better than one head-sized transform.
 
-Enabled by default for int8 per-token-head caches with head_dim % 64 == 0;
-``VLLM_GFX908_KV_ROTATE=0`` disables it. The flag must not change while a
-cache is live: rotated and unrotated entries cannot share a cache.
+DEFAULT OFF (`VLLM_GFX908_KV_ROTATE=1` enables). Measured 2026-11-11: with the
+rotation active the recipe's DFlash2 acceptance collapses to 1.0 (draft never
+accepted); with it off acceptance is 1.7-2.8 and throughput is normal. The
+draft's KV-injection path does not carry the rotation, the same desync the
+llama.cpp fork documented for DFlash. Do not enable until that path rotates
+consistently. The flag must not change while a cache is live.
 
 Scope: int8 only (the fork's other KV modes have their own mechanisms).
 """
@@ -27,7 +30,7 @@ _H64: dict = {}
 
 
 def enabled(head_dim: int) -> bool:
-    if os.environ.get("VLLM_GFX908_KV_ROTATE", "1") == "0":
+    if os.environ.get("VLLM_GFX908_KV_ROTATE", "0") != "1":
         return False
     return head_dim % BLOCK == 0
 
