@@ -137,6 +137,117 @@ __global__ void __launch_bounds__(64) gemm_a8w8_m16_kernel(
   }
 }
 
+// Multi-wave CTA: WARPS waves, each owning BN/WARPS columns of the BM x BN
+// tile (MT = BM/16 row fragments, NT = BN/(16*WARPS) column fragments). This
+// is the register-efficient shape Triton uses for the decode band; the
+// single-wave kernel above caps the tile at what one wave can hold.
+template <int BM, int BN, int KSPLIT, int WARPS>
+__global__ void __launch_bounds__(WARPS * 64) gemm_a8w8_mw_kernel(
+    const int* __restrict__ a32, const int* __restrict__ wp,
+    const float* __restrict__ a_s, const float* __restrict__ w_s,
+    hip_bfloat16* __restrict__ out, float* __restrict__ partial,
+    int M, int N, int K) {
+  constexpr int MT = BM / 16;
+  constexpr int NT = BN / (16 * WARPS);
+  const int warp = threadIdx.x >> 6;
+  const int lane = threadIdx.x & 63;
+  const int col = lane & 15;
+  const int quad = lane >> 4;
+  const int m0 = blockIdx.y * BM;
+  const int n0 = blockIdx.x * BN + warp * (16 * NT);
+  const int nt0 = blockIdx.x * (BN / 16) + warp * NT;
+  const int k16n = K / 16;
+  const int groups = K / 128;
+  const int part = KSPLIT > 1 ? (int)blockIdx.z : 0;
+  const int g0 = part * (groups / KSPLIT);
+  const int g1 = (part + 1) * (groups / KSPLIT);
+
+  float outc[MT][NT][4];
+  #pragma unroll
+  for (int mi = 0; mi < MT; ++mi)
+    #pragma unroll
+    for (int j = 0; j < NT; ++j)
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) outc[mi][j][i] = 0.0f;
+
+  for (int g = g0; g < g1; ++g) {
+    int acc[MT][NT][4];
+    #pragma unroll
+    for (int mi = 0; mi < MT; ++mi)
+      #pragma unroll
+      for (int j = 0; j < NT; ++j)
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) acc[mi][j][i] = 0;
+    #pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      int aop[4][MT];
+      int bop[4][NT];
+      #pragma unroll
+      for (int s = 0; s < 4; ++s) {
+        const int k16 = g * 8 + h * 4 + s;
+        #pragma unroll
+        for (int mi = 0; mi < MT; ++mi) {
+          const int row = m0 + mi * 16 + col;
+          aop[s][mi] = (row < M)
+              ? a32[(size_t)row * (K / 4) + k16 * 4 + quad] : 0;
+        }
+        #pragma unroll
+        for (int j = 0; j < NT; ++j) {
+          const int n = n0 + j * 16 + col;
+          bop[s][j] = (n < N)
+              ? wp[(((size_t)(nt0 + j) * k16n) + k16) * 64 + lane] : 0;
+        }
+      }
+      #pragma unroll
+      for (int s = 0; s < 4; ++s) {
+        #pragma unroll
+        for (int mi = 0; mi < MT; ++mi) {
+          #pragma unroll
+          for (int j = 0; j < NT; ++j) {
+            mfma_i8_16x16x16(aop[s][mi], bop[s][j], acc[mi][j]);
+          }
+        }
+      }
+    }
+    float as[MT][4];
+    #pragma unroll
+    for (int mi = 0; mi < MT; ++mi)
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int m = m0 + mi * 16 + 4 * quad + i;
+        as[mi][i] = (m < M) ? a_s[(size_t)m * groups + g] : 0.0f;
+      }
+    #pragma unroll
+    for (int j = 0; j < NT; ++j) {
+      const int n = n0 + j * 16 + col;
+      const float ws = (n < N) ? w_s[(size_t)n * groups + g] : 0.0f;
+      #pragma unroll
+      for (int mi = 0; mi < MT; ++mi)
+        #pragma unroll
+        for (int i = 0; i < 4; ++i)
+          outc[mi][j][i] += (float)acc[mi][j][i] * as[mi][i] * ws;
+    }
+  }
+
+  #pragma unroll
+  for (int j = 0; j < NT; ++j) {
+    const int n = n0 + j * 16 + col;
+    if (n >= N) continue;
+    #pragma unroll
+    for (int mi = 0; mi < MT; ++mi)
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int m = m0 + mi * 16 + 4 * quad + i;
+        if (m >= M) continue;
+        if (KSPLIT == 1) {
+          out[(size_t)m * N + n] = hip_bfloat16(outc[mi][j][i]);
+        } else {
+          atomicAdd(&partial[(size_t)m * N + n], outc[mi][j][i]);
+        }
+      }
+  }
+}
+
 __global__ void convert_kernel(const float* __restrict__ partial,
                                hip_bfloat16* __restrict__ out,
                                size_t count) {
@@ -171,7 +282,10 @@ extern "C" int launch_gemm_a8w8_m16(
   else if (bm == 32 && bn == 64 && ks == 1) LAUNCH(32, 64, 1);
   else if (bm == 32 && bn == 64 && ks == 2) LAUNCH(32, 64, 2);
   else if (bm == 32 && bn == 64 && ks == 4) LAUNCH(32, 64, 4);
-  else if (bm == 32 && bn == 128 && ks == 4) LAUNCH(32, 128, 4);
+  else if (bm == 32 && bn == 128 && ks == 4) {
+    gemm_a8w8_mw_kernel<32, 128, 4, 4><<<grid, 256, 0, stream_>>>(
+        (const int*)a32, (const int*)wp, a_s, w_s, out_, part_, M, N, K);
+  }
   else if (bm == 16 && bn == 64 && ks == 4) LAUNCH(16, 64, 4);
   else return -2;
   #undef LAUNCH
