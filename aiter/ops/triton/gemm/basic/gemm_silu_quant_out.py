@@ -106,7 +106,11 @@ def gemm_silu_quant_out(
         raise ValueError("Invalid SiLU projection bias")
     out = torch.empty((m, n), device=q.device, dtype=torch.int8)
     s = torch.empty((m, triton.cdiv(n, 128)), device=q.device, dtype=torch.float32)
-    bm = 16 if m <= 64 else 64
+    # gfx908: these GEMMs are CTA-concurrency bound at small M. bm=64 gives
+    # cdiv(96,64)*cdiv(1024,128)=16 CTAs for the shared-expert decode shape
+    # (M=96, 2N=2048, K=2048) and measures 143-334 us; bm=16/warps8/stages2
+    # gives 96 CTAs and measures 68 us at the same output.
+    bm = 16 if m <= 128 else 64
     if m:
         _gemm[(triton.cdiv(m, bm), triton.cdiv(n, 128))](
             q,
@@ -123,8 +127,8 @@ def gemm_silu_quant_out(
             bias is not None,
             dtype == torch.bfloat16,
             bm,
-            num_warps=4 if m <= 64 else 8,
-            num_stages=1,
+            num_warps=8 if m > 64 else 4,
+            num_stages=2 if m > 64 else 1,
             matrix_instr_nonkdim=16,
             enable_fp_fusion=False,
         )
