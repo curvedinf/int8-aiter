@@ -213,11 +213,9 @@ def moe_gemm_a8w8_blockscale(
     if quant_out:
         if not apply_swiglu or config["split_k"] != 1:
             raise ValueError("quant_out requires apply_swiglu with split_k=1")
-        if config["block_n"] != 256:
-            raise ValueError(
-                f"quant_out requires the 256-column gated tile "
-                f"(m={M} n={N} k={K} block_m={config['block_m']} "
-                f"block_n={config['block_n']})")
+        # SwiGLU halves N. One program must own a complete GS128 group of
+        # post-activation values, including for small TP2 decode grids.
+        config = {**config, "block_n": 256}
         if scatter_indx is not None:
             raise ValueError("quant_out gated path has no scatter")
         n_out = N // 2

@@ -29,6 +29,34 @@ from aiter.ops.triton.moe.quant_moe import (
 group_shape = (128, 128, 128)
 
 
+def test_small_grid_gated_quant_out():
+    """TP2 Flint routes one token to six experts with two output scale groups."""
+    torch.manual_seed(49)
+    k, n, experts = 2048, 512, 8
+    x = torch.randint(-3, 4, (1, k), dtype=torch.int8, device="cuda")
+    w = torch.randint(-3, 4, (k, n), dtype=torch.int8, device="cuda")
+    weights = w.expand(experts, -1, -1).contiguous()
+    xs = torch.ones((1, k // 128), device="cuda")
+    ws = torch.full((experts, k // 128, n), 1 / 64, device="cuda")
+    _, rd, gather, _ = init_routing_data(1, experts, 6, True, False)
+    codes, scales = moe_gemm_a8w8_blockscale(
+        x, weights, xs, ws, routing_data=rd, gather_indx=gather,
+        per_row_x_scale=True, w_blockscale_n=1, apply_swiglu=True,
+        swiglu_add_residual=False, quant_out=True,
+    )
+    # Integer-valued dot products are exactly representable in FP32.
+    projected = (x.float().cpu() @ w.float().cpu() / 64).bfloat16().float()
+    gate, up = projected[..., ::2], projected[..., 1::2]
+    out = (torch.nn.functional.silu(gate) * up).bfloat16().float()
+    groups = out.view(1, n // 256, 128)
+    expected_scales = groups.abs().amax(-1).clamp_min(1e-8) / 127
+    expected_codes = (groups / expected_scales.unsqueeze(-1)).round().to(torch.int8)
+    torch.testing.assert_close(scales.cpu(), expected_scales.expand_as(scales))
+    torch.testing.assert_close(
+        codes.cpu(), expected_codes.reshape(1, n // 2).expand_as(codes)
+    )
+
+
 def init_routing_data(
     m, n_expts_tot, n_expts_act, do_gather, do_scatter, device="cuda"
 ):
