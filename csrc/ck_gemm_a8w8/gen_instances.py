@@ -443,9 +443,13 @@ torch::Tensor
 
 def get_tune_dict(tune_dict_csv):
     if os.path.exists(tune_dict_csv):
-        return build_tune_dict(
-            pd.read_csv(tune_dict_csv), default_kernels_dict, kernels_list
-        )
+        rows = pd.read_csv(tune_dict_csv)
+        # The split-K sweep measures partition counts with the dispatched
+        # kernel. Its placeholder kernelId=0 is not a measured tile choice.
+        # The runtime still reads these rows for their splitK.
+        if "kernelName" in rows:
+            rows = rows[rows["kernelName"] != "ck_splitk_tuned"]
+        return build_tune_dict(rows, default_kernels_dict, kernels_list)
     return default_kernels_dict
 
 

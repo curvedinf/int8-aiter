@@ -29,6 +29,7 @@ import os
 import sys
 import tempfile
 import textwrap
+from unittest.mock import patch
 
 # Ensure the repo-local aiter is imported, not any system/site-packages install.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -526,7 +527,10 @@ def test_blockscale_kernel_name_forwarding():
             lambda self, _p=csv_path: _p
         )
         try:
-            yield
+            # This test stubs the CK entry points and supplies CPU tensors.
+            # Select CK even on hosts that normally route blockscale to Triton.
+            with patch.object(a8w8_mod, "_hip_blockscale_supported", return_value=True):
+                yield
         finally:
             cls.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE = saved
 
@@ -969,12 +973,31 @@ def test_gfx908_instance_pruning():
 
     with tempfile.TemporaryDirectory() as tmp:
         files, hdr = _run_codegen(tmp + "/n908", "gfx908")
-        # Post-tuning: 45 keep-list kernels (7 defaults + 42 tuned winners)
-        # x 4 int8 dtype combos; 3 kernels_list names are duplicated, hence
-        # 188 files < 45*4.
+        from gen_instances import get_tune_dict, kernels_list
+
+        csv = os.path.join(tmp, "splitk.csv")
+        with open(csv, "w") as f:
+            f.write("gfx,cu_num,M,N,K,kernelId,kernelName,splitK\n")
+            f.write("gfx908,120,8,8704,5120,0,ck_splitk_tuned,2\n")
+            f.write(f"gfx908,120,14,8704,5120,0,{kernels_list[0].name},0\n")
+        with patch.dict(os.environ, GPU_ARCHS="gfx908", CU_NUM="120"):
+            lookup = get_tune_dict(csv)
+            tuned = get_tune_dict(
+                os.path.join(_REPO_ROOT, "aiter/configs/a8w8_tuned_gemm.csv")
+            )
         _check(
-            "gfx908 non-tune: tuned keep-list x 4 int8 combos (188 files)",
-            len(files) == 188,
+            "split-K-only rows leave tile dispatch to the fallback",
+            ("gfx908", 120, 8, 8704, 5120) not in lookup,
+        )
+        _check(
+            "a measured kernel ID zero remains a valid tile",
+            lookup.get(("gfx908", 120, 14, 8704, 5120)) == kernels_list[0],
+        )
+        tiles = {k.name for k in tuned.values()}
+        emitted_tiles = {name.split("_ab")[0] for name in files}
+        _check(
+            "gfx908 non-tune: four int8 instances per tuned or heuristic tile",
+            emitted_tiles == tiles and len(files) == len(tiles) * 4,
             f"got {len(files)}",
         )
         _check(
@@ -1021,16 +1044,19 @@ def test_gfx908_instance_pruning():
             any("_abF8_" in f for f in files),
         )
 
-    # Tile filter: 7 default-resolvable ids -> 7 impl files in tune mode
+    # Tune mode should emit precisely the requested tiles.
     keep = os.path.join(
         _REPO_ROOT, "csrc/ck_gemm_a8w8/a8w8_instance_keep_list.txt"
     )
     with tempfile.TemporaryDirectory() as tmp:
         _run_codegen(tmp + "/tl", "gfx908", istune=True, instance_list=keep)
         impls = os.listdir(os.path.join(tmp + "/tl", "impl"))
+        with open(keep) as f:
+            ids = [int(line) for line in f if line.strip() and not line.startswith("#")]
+        expected_tiles = {kernels_list[i].name for i in ids}
         _check(
-            "tile filter (tune): 45 keep-list kernels instantiated",
-            len(impls) == 45,
+            "tile filter (tune): only keep-list kernels instantiated",
+            {os.path.splitext(f)[0] for f in impls} == expected_tiles,
             f"got {len(impls)}",
         )
 
