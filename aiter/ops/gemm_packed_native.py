@@ -266,11 +266,15 @@ def affine_g128(
     packet_load=False,
     gated_quant=False,
     clamp_limit=None,
+    route_group=0,
+    output_dtype=torch.float32,
 ):
     """G128 W4A8 or symmetric W8A8 with the same tiling and route scatter.
 
     Weights are [N,K/2] U4 or [N,K] S8, optionally prefixed by experts.
-    A routed plan uses 16-route sorted blocks, padded with route_count.
+    A routed plan uses sorted blocks padded with route_count. route_group controls
+    how many adjacent route blocks share a column tile before advancing columns.
+    An unsplit Triton projection can store its FP32 accumulator directly as FP16.
     """
     if q.ndim != 2 or q.dtype != torch.int8:
         raise ValueError("Expected a matrix of signed INT8 activations")
@@ -317,6 +321,13 @@ def affine_g128(
     if plan is not None and split != 1:
         raise ValueError("Routed affine GEMM requires split=1")
     rows = m if plan is None or down else m * topk
+    if output_dtype != torch.float32 and (
+        output_dtype != torch.float16
+        or triton_tiles is None
+        or split != 1
+        or gated_quant
+    ):
+        raise ValueError("Direct FP16 output requires an unsplit Triton GEMM")
     if gated_quant:
         if (
             triton_tiles is None
@@ -334,7 +345,7 @@ def affine_g128(
         )
         output_sums = torch.empty_like(output_scales, dtype=torch.int32)
     else:
-        out = torch.empty((split, rows, n), device=q.device, dtype=torch.float32)
+        out = torch.empty((split, rows, n), device=q.device, dtype=output_dtype)
         output_scales = output_sums = None
     sorted_ids, experts, count = (None, None, None) if plan is None else plan
     tile_m = route_tile if triton_tiles is None else triton_tiles[0]
@@ -407,6 +418,7 @@ def affine_g128(
             GATE_OUT=gated_quant,
             GATE_LIMIT=clamp_limit,
             YSUM=output_sums,
+            ROUTE_GROUP_M=route_group,
             num_warps=warps,
             num_stages=1,
             matrix_instr_nonkdim=16,

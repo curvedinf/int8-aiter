@@ -39,8 +39,10 @@ def _quantize_pair(low, high, lane):
     return q0, q1, scale
 
 
-def _quantize_rows(shared, wave, lane, base, group, codes, scales, sums, m, width):
-    for local in range(8):
+def _quantize_rows(
+    shared, wave, lane, base, group, codes, scales, sums, m, width, first=0, stop=8
+):
+    for local in range(first, stop):
         row = wave * 8 + local
         values = []
         for half in (0, 64):

@@ -271,11 +271,22 @@ def _gemm(
     GATE_OUT: tl.constexpr = False,
     GATE_LIMIT: tl.constexpr = None,
     YSUM=None,
+    ROUTE_GROUP_M: tl.constexpr = 0,
 ):
     slot = -1
-    rm = tl.program_id(0) * BM + tl.arange(0, BM)
+    tile_m, tile_n = tl.program_id(0), tl.program_id(1)
+    if GROUPED and ROUTE_GROUP_M > 0:
+        rows, cols = tl.num_programs(0), tl.num_programs(1)
+        linear = tile_m + rows * tile_n
+        route_span = ROUTE_GROUP_M * cols
+        first = linear // route_span * ROUTE_GROUP_M
+        height = tl.minimum(ROUTE_GROUP_M, rows - first)
+        offset = linear % route_span
+        tile_m = first + offset % height
+        tile_n = offset // height
+    rm = tile_m * BM + tl.arange(0, BM)
     if ROUTED:
-        route = tl.program_id(0)
+        route = tile_m
         if GROUPED:
             if route * BM >= tl.load(COUNT):
                 return
@@ -298,11 +309,11 @@ def _gemm(
     if GATE_OUT:
         tl.static_assert(BN == 256 and SPLIT_K == 1 and PACKET_LOAD)
         columns = tl.arange(0, BN)
-        out_col = tl.program_id(1) * 128
+        out_col = tile_n * 128
         rn = out_col + columns + tl.where(columns >= 128, (N - BN) // 2, 0)
     else:
-        out_col = tl.program_id(1) * BN
-        rn=out_col+tl.arange(0,BN)
+        out_col = tile_n * BN
+        rn = out_col + tl.arange(0, BN)
     rk = tl.arange(0, 128)
     acc = tl.zeros((BM, BN), tl.float32)
     groups: tl.constexpr = (LENGTH + 127) // 128
@@ -389,7 +400,7 @@ def _gemm(
         scale = tl.maximum(tl.div_rn(tl.max(tl.abs(activation), 1), 127.0), 1.0e-30)
         code = tldevice.nearbyint(tl.div_rn(activation, scale[:, None])).to(tl.int8)
         out_k: tl.constexpr = N // 2
-        cg = tl.program_id(1)
+        cg = tile_n
         cols = out_col + tl.arange(0, 128)
         tl.store(
             Y + rm[:, None].to(tl.int64) * out_k + cols[None, :], code, rm[:, None] < M
@@ -407,7 +418,7 @@ def _gemm(
         tl.store(
             Y + rm[:, None] * N + rn[None, :], q, (rm[:, None] < M) & (rn[None, :] < N)
         )
-        tl.store(YS + rm * tl.cdiv(N, 128) + tl.program_id(1), sy, rm < M)
+        tl.store(YS + rm * tl.cdiv(N, 128) + tile_n, sy, rm < M)
     else:
         tl.store(
             Y + rm[:, None] * N + rn[None, :],

@@ -39,7 +39,7 @@ def _reduce(values, lane, fn):
     return value
 
 
-def _compute(config, tensors, sizes):
+def _compute(config, tensors, sizes, tile_peaks=None):
     heads, group, splits, value_tiles, k16 = config
     keys, scales, scores, addresses, sinks, output, maxima, normalizers, partials = (
         tensors
@@ -66,6 +66,13 @@ def _compute(config, tensors, sizes):
             )
             for i in range(8)
         ]
+
+    def tile_peak(base, values):
+        if tile_peaks is None:
+            return _reduce(values, lane, _maximum)
+        count = (pitch + 31) // 32
+        dest = (row * heads + head_in % heads) * count + _minimum(base // 32, count - 1)
+        return (base < width).select(tile_peaks[dest], negative)
 
     def probabilities(values, peak):
         return [(v > negative).select(_exp(v - peak), zero) for v in values]
@@ -155,7 +162,7 @@ def _compute(config, tensors, sizes):
                 if step == 0:
                     vals = load_scores(next_base)
                 elif step == 1:
-                    peak = _maximum(running_max, _reduce(vals, lane, _maximum))
+                    peak = _maximum(running_max, tile_peak(next_base, vals))
                     next_retain = _exp(running_max - peak)
                 elif 2 <= step <= 5:
                     new_probs.extend(
@@ -177,7 +184,7 @@ def _compute(config, tensors, sizes):
         return updated, peak, total, next_retain, pack(new_probs)
 
     vals = load_scores(first)
-    peak = _reduce(vals, lane, _maximum)
+    peak = tile_peak(first, vals)
     probs = probabilities(vals, peak)
     total = _reduce(probs, lane, lambda a, b: a + b)
     initial = [

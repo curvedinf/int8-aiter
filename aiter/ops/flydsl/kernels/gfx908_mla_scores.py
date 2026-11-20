@@ -23,7 +23,18 @@ def _byte_offset(slot, page_size, page_stride, row_stride):
 
 
 def _score_groups(
-    query, qs, keys, ks, lane, row, heads, group, rope_group, offset, offsets
+    query,
+    qs,
+    keys,
+    ks,
+    lane,
+    row,
+    heads,
+    group,
+    rope_group,
+    offset,
+    offsets,
+    prepare=None,
 ):
     """MFMA owns 16 heads by 64 keys. Scale group g-1 during the next MFMA."""
     latent_groups = 512 // group
@@ -64,6 +75,8 @@ def _score_groups(
                     perm,
                 )
             )
+            if prepare is not None and g == 0:
+                prepare(step)
             if g:
                 for index in range(step, 16, steps):
                     sums[index] = sums[index] + scaled(index, previous, g - 1)

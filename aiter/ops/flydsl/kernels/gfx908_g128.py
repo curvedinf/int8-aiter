@@ -38,7 +38,7 @@ def _scaled(dot, activation_scale, weight_scale, activation_sum, weight_zero):
     return (fx.Float32(dot) * activation_scale) * weight_scale
 
 
-def _group(w4, operands, geometry, group, previous, output):
+def _group(w4, operands, geometry, group, previous, output, independent=None):
     activation, weight, scales, weight_scales, sums, zeros = operands
     lane, tile, activation_row, rows, channels, groups = geometry
     packed_width = 2 if w4 else 4
@@ -76,6 +76,8 @@ def _group(w4, operands, geometry, group, previous, output):
                     ir.Attribute.parse("#rocdl<mfma_perm_b none>"),
                 )
             )
+            if independent is not None:
+                independent(packet, word)
             if draining:
                 i = packet * 4 + word
                 position = rows[i] * groups + prior
@@ -92,11 +94,11 @@ def _group(w4, operands, geometry, group, previous, output):
     return integer, fx.Vector.from_elements(updated) if draining else output
 
 
-def _wave_product(w4, operands, geometry, first, end):
+def _wave_product(w4, operands, geometry, first, end, independent=None):
     """Return the 32 scaled output elements per lane, shared by both epilogues."""
     lane, tile, _, rows, n, groups = geometry
     fp = fx.Vector.from_elements([fx.Float32(0.0)] * 32)
-    integer, _ = _group(w4, operands, geometry, first, None, fp)
+    integer, _ = _group(w4, operands, geometry, first, None, fp, independent)
     loop = scf.ForOp(
         (first + 1).ir_value(), end.ir_value(), fx.Int32(1).ir_value(), [integer, fp]
     )
