@@ -79,7 +79,7 @@ def _decode_nvfp4(
 
 
 @triton.jit
-def _quant(X, Q, S, M: tl.constexpr, K: tl.constexpr):
+def _quant(X, Q, S, K: tl.constexpr):
     row, group = tl.program_id(0), tl.program_id(1)
     k = group * 128 + tl.arange(0, 128)
     v = tl.load(X + row * K + k, k < K, 0).to(tl.float32)

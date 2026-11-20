@@ -82,7 +82,7 @@ def quantize(x):
     m, k = x.shape
     q = torch.empty_like(x, dtype=torch.int8)
     s = torch.empty((m, triton.cdiv(k, 128)), device=x.device, dtype=torch.float32)
-    _quant[(m, triton.cdiv(k, 128))](x, q, s, m, k)
+    _quant[(m, triton.cdiv(k, 128))](x, q, s, k)
     return q, s
 
 

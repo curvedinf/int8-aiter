@@ -7,7 +7,7 @@ import triton.language as tl
 import triton.language.extra.libdevice as lib
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _gemm(
     X,
     XS,
@@ -16,7 +16,7 @@ def _gemm(
     BIAS,
     Y,
     S,
-    M: tl.constexpr,
+    M,
     N: tl.constexpr,
     K: tl.constexpr,
     GATED: tl.constexpr,
