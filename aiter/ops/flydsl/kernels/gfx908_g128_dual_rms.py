@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Normalize two strided DFly2 inputs directly into the following W8A8 projection."""
 
-from functools import lru_cache, cache
+from functools import cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Eight hyper-connection gate dots on MFMA, with residual norms on the VALU."""
 
-from functools import lru_cache, cache
+from functools import cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx

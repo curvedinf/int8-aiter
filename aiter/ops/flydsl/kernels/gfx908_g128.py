@@ -6,7 +6,7 @@ the vector ALU scales the 32 results per lane from the preceding group.
 Weights have the 64-channel layout from pack_affine_weights(overlap=True).
 """
 
-from functools import lru_cache, cache
+from functools import cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx

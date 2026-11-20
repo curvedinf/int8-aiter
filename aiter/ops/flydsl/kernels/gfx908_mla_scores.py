@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Selected INT8 MLA scores for gfx908 with separate latent and rotary scales."""
 
-from functools import lru_cache, cache
+from functools import cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx

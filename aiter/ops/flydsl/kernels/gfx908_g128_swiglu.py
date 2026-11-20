@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fuse gate/up G128 GEMM, FP16 SwiGLU and row-group INT8 quantization on CDNA1."""
 
-from functools import lru_cache, cache
+from functools import cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx

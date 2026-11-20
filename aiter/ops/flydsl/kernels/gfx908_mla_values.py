@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pipeline the next selected-key softmax with the current FP16 value GEMM."""
 
-from functools import lru_cache, cache
+from functools import cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
