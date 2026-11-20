@@ -77,6 +77,10 @@ def is_flydsl_available() -> bool:
     # during config registration, so report flydsl as unavailable there instead
     # of failing the import.
     from flydsl.runtime.device import get_rocm_arch
-    from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
+
+    try:
+        from flydsl.runtime.device import SMEM_CAPACITY_MAP
+    except ImportError:  # FlyDSL < 0.5
+        from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
 
     return get_rocm_arch() in SMEM_CAPACITY_MAP

@@ -79,14 +79,154 @@ def _decode_nvfp4(
 
 
 @triton.jit
-def _quant(X, Q, S, K: tl.constexpr):
+def _gated_fp16(gate, up, LIMIT: tl.constexpr):
+    gate = gate.to(tl.float16).to(tl.float32)
+    up = up.to(tl.float16).to(tl.float32)
+    if LIMIT is not None:
+        gate = tl.minimum(gate, LIMIT)
+        up = tl.minimum(tl.maximum(up, -LIMIT), LIMIT)
+    silu = tl.div_rn(gate, 1.0 + tldevice.exp(-gate)).to(tl.float16).to(tl.float32)
+    return (silu * up).to(tl.float16).to(tl.float32)
+
+
+@triton.jit
+def _quant(
+    X,
+    Q,
+    S,
+    K: tl.constexpr,
+    SUM=None,
+    SWIGLU: tl.constexpr = False,
+    LIMIT: tl.constexpr = None,
+):
     row, group = tl.program_id(0), tl.program_id(1)
     k = group * 128 + tl.arange(0, 128)
-    v = tl.load(X + row * K + k, k < K, 0).to(tl.float32)
+    offset = row.to(tl.int64) * K + k
+    if SWIGLU:
+        base = row.to(tl.int64) * (2 * K) + k
+        gate = tl.load(X + base, k < K, 0)
+        up = tl.load(X + base + K, k < K, 0)
+        v = _gated_fp16(gate, up, LIMIT)
+    else:
+        v = tl.load(X + offset, k < K, 0).to(tl.float32)
     scale = tl.maximum(tl.div_rn(tl.max(tl.abs(v), 0), 127.0), 1.0e-30)
     q = tldevice.nearbyint(tl.div_rn(v, scale))
-    tl.store(Q + row * K + k, q.to(tl.int8), k < K)
-    tl.store(S + row * tl.cdiv(K, 128) + group, scale)
+    tl.store(Q + offset, q.to(tl.int8), k < K)
+    index = row.to(tl.int64) * tl.cdiv(K, 128) + group
+    tl.store(S + index, scale)
+    if SUM is not None:
+        tl.store(SUM + index, tl.sum(q.to(tl.int32), 0))
+
+
+@triton.jit
+def _affine_codes(
+    W, rn, rk, N: tl.constexpr, K: tl.constexpr, W4: tl.constexpr, WAVE: tl.constexpr
+):
+    if WAVE == 3:
+        # 64 outputs per wave, one contiguous K16 vector per output.
+        row = rn[:, None].to(tl.int64)
+        col = rk[None, :]
+        packet = (
+            (row // 64 * (K // 128) + col // 128) * 8 + col % 128 // 16
+        ) * 64 + row % 64
+        if W4:
+            byte = tl.load(W + packet * 8 + col % 16 // 8 * 4 + col % 4, row < N, 0)
+            return (((byte >> ((col % 8 // 4) * 4)) & 15) ^ 8).to(tl.int8)
+        return tl.load(W + packet * 16 + col % 16, row < N, 0).to(tl.int8)
+    # Index the same N16/K16 lane packing as the gfx908 HIP kernel.
+    if WAVE:
+        if WAVE == 2:
+            words = (
+                (
+                    ((rn[:, None].to(tl.int64) // 16) * (K // 128) + rk[None, :] // 128)
+                    * 4
+                    + (rk[None, :] % 16) // 4
+                )
+                * 16
+                + rn[:, None] % 16
+            ) * 8 + (rk[None, :] % 128) // 16
+        else:
+            words = (
+                ((rn[:, None].to(tl.int64) // 16) * (K // 16) + rk[None, :] // 16) * 4
+                + (rk[None, :] % 16) // 4
+            ) * 16 + rn[:, None] % 16
+        if W4:
+            offset = words * 2 + rk[None, :] % 4 // 2
+        else:
+            offset = words * 4 + rk[None, :] % 4
+    else:
+        if W4:
+            offset = rn[:, None].to(tl.int64) * (K // 2) + rk[None, :] // 2
+        else:
+            offset = rn[:, None].to(tl.int64) * K + rk[None, :]
+    data = tl.load(W + offset, rn[:, None] < N, 0)
+    if W4:
+        data = (data >> ((rk[None, :] % 2) * 4)) & 15
+    return data.to(tl.int8)
+
+
+@triton.jit
+def _affine_wave_tile(
+    W,
+    row0,
+    group,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BN: tl.constexpr,
+    W4: tl.constexpr,
+    WAVE: tl.constexpr,
+    PAIRED: tl.constexpr = False,
+):
+    if WAVE == 3 and BN < 64:
+        return _affine_codes(
+            W, row0 + tl.arange(0, BN), group * 128 + tl.arange(0, 128), N, K, W4, WAVE
+        )
+    elif WAVE == 3:
+        width: tl.constexpr = 8 if W4 else 16
+        size: tl.constexpr = 8 * 64 * width
+        i = tl.arange(0, BN // 64 * size)
+        tile = row0 // 64 + i // size
+        if PAIRED:
+            tile += tl.where(i // size >= BN // 128, (N - BN) // 128, 0)
+        addr = (tile.to(tl.int64) * (K // 128) + group) * size + i % size
+        data = tl.load(W + addr, tile * 64 < N, 0)
+        if W4:
+            pairs = (data ^ 136).reshape((BN // 64, 8, 64, 2, 4))
+            codes = tl.join((pairs & 15).to(tl.int8), (pairs >> 4).to(tl.int8))
+            return codes.permute(0, 2, 1, 3, 5, 4).reshape((BN, 128))
+        else:
+            return (
+                data.reshape((BN // 64, 8, 64, 16))
+                .permute(0, 2, 1, 3)
+                .reshape((BN, 128))
+            )
+    else:
+        # Load a whole contiguous G128 packet per 16 output rows. Reorder locally
+        # into the same [N,K] dot operand used by the symmetric INT8 path.
+        word: tl.constexpr = 2 if W4 else 4
+        packet: tl.constexpr = 16 * 8 * 4 * word
+        i = tl.arange(0, (BN // 16) * packet)
+        tile = row0 // 16 + i // packet
+        if PAIRED:
+            tile += tl.where(i // packet >= BN // 32, (N - BN) // 32, 0)
+        offset = (tile.to(tl.int64) * (K // 128) + group) * packet + i % packet
+        data = tl.load(W + offset, tile * 16 < N, 0)
+        if W4:
+            codes = tl.join((data & 15).to(tl.int8), (data >> 4).to(tl.int8))
+            if WAVE == 2:
+                codes = codes.reshape((BN // 16, 4, 16, 8, word, 2)).permute(
+                    0, 2, 3, 1, 4, 5
+                )
+            else:
+                codes = codes.reshape((BN // 16, 8, 4, 16, word, 2)).permute(
+                    0, 3, 1, 2, 4, 5
+                )
+        else:
+            if WAVE == 2:
+                codes = data.reshape((BN // 16, 4, 16, 8, word)).permute(0, 2, 3, 1, 4)
+            else:
+                codes = data.reshape((BN // 16, 8, 4, 16, word)).permute(0, 3, 1, 2, 4)
+        return codes.reshape((BN,128))
 
 
 @triton.jit(do_not_specialize=["M"])
@@ -123,6 +263,14 @@ def _gemm(
     EXPERT_WEIGHT=None,
     EXPERT_MAP=None,
     EXPERT_CACHED: tl.constexpr = False,
+    ASUM=None,
+    WZERO=None,
+    AFFINE_WAVE: tl.constexpr = False,
+    BN: tl.constexpr = 128,
+    PACKET_LOAD: tl.constexpr = False,
+    GATE_OUT: tl.constexpr = False,
+    GATE_LIMIT: tl.constexpr = None,
+    YSUM=None,
 ):
     slot = -1
     rm = tl.program_id(0) * BM + tl.arange(0, BM)
@@ -137,6 +285,8 @@ def _gemm(
             expert = tl.load(IDS + route).to(tl.int64)
             rm = tl.where(tl.arange(0, BM) == 0, route, M)
         W += expert * WSTRIDE
+        if WZERO is not None:
+            WZERO += expert * N * (K // 128)
         if EXPERT_CACHED:
             slot = tl.load(EXPERT_MAP + expert)
             EXPERT_WEIGHT += tl.maximum(slot, 0).to(tl.int64) * N * LENGTH
@@ -145,9 +295,16 @@ def _gemm(
     xm = rm
     if ROUTED and not DOWN:
         xm = rm // TOPK
-    rn = tl.program_id(1) * 128 + tl.arange(0, 128)
+    if GATE_OUT:
+        tl.static_assert(BN == 256 and SPLIT_K == 1 and PACKET_LOAD)
+        columns = tl.arange(0, BN)
+        out_col = tl.program_id(1) * 128
+        rn = out_col + columns + tl.where(columns >= 128, (N - BN) // 2, 0)
+    else:
+        out_col = tl.program_id(1) * BN
+        rn=out_col+tl.arange(0,BN)
     rk = tl.arange(0, 128)
-    acc = tl.zeros((BM, 128), tl.float32)
+    acc = tl.zeros((BM, BN), tl.float32)
     groups: tl.constexpr = (LENGTH + 127) // 128
     span: tl.constexpr = (groups + SPLIT_K - 1) // SPLIT_K
     if SPLIT_K == 1:
@@ -158,7 +315,31 @@ def _gemm(
         end = tl.minimum((tl.program_id(2) + 1) * span, groups)
     for group in range(begin, end):
         local_k = group * 128 + rk
-        if EXPERT_CACHED and slot >= 0:
+        if CODEC == "affine_w4" or CODEC == "signed_w8":
+            if AFFINE_WAVE == 3:
+                gi = group * N + rn
+            elif AFFINE_WAVE:
+                gi = ((rn // 16) * groups + group) * 16 + rn % 16
+            else:
+                gi = rn * groups + group
+            if AFFINE_WAVE and PACKET_LOAD:
+                wq = _affine_wave_tile(
+                    W,
+                    out_col,
+                    group,
+                    N,
+                    K,
+                    BN,
+                    CODEC == "affine_w4",
+                    AFFINE_WAVE,
+                    GATE_OUT,
+                )
+            else:
+                wq = _affine_codes(
+                    W, rn, local_k, N, K, CODEC == "affine_w4", AFFINE_WAVE
+                )
+            sw = tl.load(WEIGHT_SCALES + gi, rn < N, 0).to(tl.float32)
+        elif EXPERT_CACHED and slot >= 0:
             # One expert per program makes this branch uniform. Never load a
             # cold slot: its allocation can still contain unwritten values.
             wq = tl.load(
@@ -189,13 +370,32 @@ def _gemm(
         )
         sx = tl.load(XS + xm * tl.cdiv(LENGTH, 128) + group, rm < M, 0)
         dot = tl.dot(x, tl.trans(wq), out_dtype=tl.int32)
-        acc += dot.to(tl.float32) * sx[:, None] * sw[None, :]
+        product = dot.to(tl.float32)
+        if CODEC == "affine_w4":
+            zx = tl.load(ASUM + xm * groups + group, rm < M, 0).to(tl.float32)
+            zw = tl.load(WZERO + gi, rn < N, 0).to(tl.float32)
+            product = product - zx[:, None] * zw[None, :]
+        acc += product * sx[:, None] * sw[None, :]
     if SPLIT_K > 1:
         tl.store(
             Y + tl.program_id(2) * M * N + rm[:, None] * N + rn[None, :],
             acc,
             (rm[:, None] < M) & (rn[None, :] < N),
         )
+        return
+    if GATE_OUT:
+        ga, up = tl.split(acc.reshape((BM, 2, 128)).permute(0, 2, 1))
+        activation = _gated_fp16(ga, up, GATE_LIMIT)
+        scale = tl.maximum(tl.div_rn(tl.max(tl.abs(activation), 1), 127.0), 1.0e-30)
+        code = tldevice.nearbyint(tl.div_rn(activation, scale[:, None])).to(tl.int8)
+        out_k: tl.constexpr = N // 2
+        cg = tl.program_id(1)
+        cols = out_col + tl.arange(0, 128)
+        tl.store(
+            Y + rm[:, None].to(tl.int64) * out_k + cols[None, :], code, rm[:, None] < M
+        )
+        tl.store(YS + rm * (out_k // 128) + cg, scale, rm < M)
+        tl.store(YSUM + rm * (out_k // 128) + cg, tl.sum(code.to(tl.int32), 1), rm < M)
         return
     if RELU2:
         acc = tl.maximum(acc, 0.0)
@@ -228,29 +428,32 @@ def _embedding(
 
 
 @triton.jit
-def _route_product(Y, WEIGHTS, token, cols, route: tl.constexpr, N: tl.constexpr):
-    value = tl.load(Y + (token * 9 + route) * N + cols, cols < N, 0.0)
-    weight = tl.load(WEIGHTS + token * 9 + route)
-    return value * weight
+def _route_product(
+    Y, WEIGHTS, token, cols, route: tl.constexpr, N: tl.constexpr, TOPK: tl.constexpr
+):
+    value = tl.load(Y + (token * TOPK + route) * N + cols, cols < N, 0)
+    return value * tl.load(WEIGHTS + token * TOPK + route).to(tl.float32)
 
 
 @triton.jit
-def _combine_experts(Y, WEIGHTS, OUT, N: tl.constexpr, B: tl.constexpr):
+def _combine_experts(Y, WEIGHTS, OUT, N: tl.constexpr, B: tl.constexpr, TOPK: tl.constexpr = 9):
     token = tl.program_id(0)
     cols = tl.program_id(1) * B + tl.arange(0, B)
-    # ATen's non-contiguous nine-element sum does not split the input across
-    # warps. It uses four accumulators, then combines them from left to right.
+    # Match the four lane-local accumulators used by the native reduction.
     zero = tl.full((B,), 0.0, tl.float32)
-    a0 = zero + _route_product(Y, WEIGHTS, token, cols, 0, N)
-    a1 = zero + _route_product(Y, WEIGHTS, token, cols, 1, N)
-    a2 = zero + _route_product(Y, WEIGHTS, token, cols, 2, N)
-    a3 = zero + _route_product(Y, WEIGHTS, token, cols, 3, N)
-    a0 = a0 + _route_product(Y, WEIGHTS, token, cols, 4, N)
-    a1 = a1 + _route_product(Y, WEIGHTS, token, cols, 5, N)
-    a2 = a2 + _route_product(Y, WEIGHTS, token, cols, 6, N)
-    a3 = a3 + _route_product(Y, WEIGHTS, token, cols, 7, N)
-    a0 = a0 + _route_product(Y, WEIGHTS, token, cols, 8, N)
-    result = ((a0 + a1) + a2) + a3
+    a0 = zero
+    a1 = zero
+    a2 = zero
+    a3 = zero
+    for i in tl.static_range(0, TOPK, 4):
+        a0 += _route_product(Y, WEIGHTS, token, cols, i, N, TOPK)
+        if i + 1 < TOPK:
+            a1 += _route_product(Y, WEIGHTS, token, cols, i + 1, N, TOPK)
+        if i + 2 < TOPK:
+            a2 += _route_product(Y, WEIGHTS, token, cols, i + 2, N, TOPK)
+        if i + 3 < TOPK:
+            a3 += _route_product(Y, WEIGHTS, token, cols, i + 3, N, TOPK)
+    result = ((a0+a1)+a2)+a3
     result = tl.where(result == 0.0, 0.0, result)
     tl.store(OUT + token * N + cols, result, cols < N)
 

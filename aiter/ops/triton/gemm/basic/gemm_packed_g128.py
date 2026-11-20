@@ -71,7 +71,7 @@ def make_grid(device):
     )
 
 
-def quantize(x):
+def quantize(x, *, with_sums=False, swiglu=False, clamp_limit=None):
     if (
         x.ndim != 2
         or not x.is_cuda
@@ -80,9 +80,17 @@ def quantize(x):
     ):
         raise ValueError("Expected contiguous floating-point GPU activation matrix")
     m, k = x.shape
-    q = torch.empty_like(x, dtype=torch.int8)
+    if swiglu:
+        if k % 2:
+            raise ValueError("SwiGLU needs equally sized gate and up projections")
+        k //= 2
+    q = torch.empty((m,k), device=x.device, dtype=torch.int8)
     s = torch.empty((m, triton.cdiv(k, 128)), device=x.device, dtype=torch.float32)
-    _quant[(m, triton.cdiv(k, 128))](x, q, s, k)
+    if with_sums:
+        sums = torch.empty_like(s, dtype=torch.int32)
+        _quant[(m, triton.cdiv(k, 128))](x, q, s, k, sums, swiglu, clamp_limit)
+        return q, s, sums
+    _quant[(m, triton.cdiv(k, 128))](x, q, s, k, None, swiglu, clamp_limit)
     return q, s
 
 
@@ -249,7 +257,7 @@ def packed_embedding(weight, ids, width, dtype=torch.bfloat16):
 
 
 def combine_experts(y, weights, dtype):
-    """Fuse nine route products, ATen's FP32 sum order, and the output cast."""
+    """Fuse route products, native FP32 reduction order and the output cast."""
     if y.ndim != 2 or weights.ndim != 2:
         raise ValueError("Expected route values [M*topk,N] and weights [M,topk]")
     m, topk = weights.shape
@@ -258,7 +266,7 @@ def combine_experts(y, weights, dtype):
     n = y.shape[-1]
     if (
         not y.is_cuda
-        or topk != 9
+        or topk not in (9,16)
         or n % 4
         or y.dtype != torch.float32
         or weights.dtype != torch.float32
@@ -271,7 +279,7 @@ def combine_experts(y, weights, dtype):
     if m and n:
         block = 256 if m <= 64 else 512
         _combine_experts[(m, triton.cdiv(n, block))](
-            y, weights, output, n, block, num_warps=4, enable_fp_fusion=False
+            y, weights, output, n, block, topk, num_warps=4, enable_fp_fusion=False
         )
     return output
 
