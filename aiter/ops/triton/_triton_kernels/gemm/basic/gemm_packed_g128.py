@@ -85,7 +85,15 @@ def _gated_fp16(gate, up, LIMIT: tl.constexpr):
     if LIMIT is not None:
         gate = tl.minimum(gate, LIMIT)
         up = tl.minimum(tl.maximum(up, -LIMIT), LIMIT)
-    silu = tl.div_rn(gate, 1.0 + tldevice.exp(-gate)).to(tl.float16).to(tl.float32)
+    # Reduce exp(-gate) to an exp2 near zero. Keeping this FP32 operation
+    # order gives the same FP16 SiLU rounding across ROCm device libraries.
+    log2e: tl.constexpr = 1.4426950216293335
+    exponent = tldevice.nearbyint(-gate * log2e)
+    fraction = tl.fma(-gate, log2e, -exponent)
+    exp_neg_gate = tldevice.ldexp(tl.exp2(fraction), exponent.to(tl.int32))
+    exp_neg_gate = tl.where(gate <= -88.72283935546875, float("inf"), exp_neg_gate)
+    exp_neg_gate = tl.where(gate > 103.2789306640625, 0.0, exp_neg_gate)
+    silu = tl.div_rn(gate, 1.0 + exp_neg_gate).to(tl.float16).to(tl.float32)
     return (silu * up).to(tl.float16).to(tl.float32)
 
 

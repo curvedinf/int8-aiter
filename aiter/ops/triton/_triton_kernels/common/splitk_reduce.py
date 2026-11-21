@@ -38,6 +38,7 @@ def _gemm_splitk_reduce_kernel(
     activation: tl.constexpr,
     use_activation: tl.constexpr,
     KERNEL_NAME: tl.constexpr = "_gemm_splitk_reduce_kernel",
+    ORDER_FOUR_SPLITS: tl.constexpr = False,
 ):
     tl.assume(stride_c_in_k > 0)
     tl.assume(stride_c_in_m > 0)
@@ -55,19 +56,33 @@ def _gemm_splitk_reduce_kernel(
 
     offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
     offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, MAX_KSPLIT)
-    c_in_ptrs = (
-        c_in_ptr
-        + (offs_k[:, None, None] * stride_c_in_k)
-        + (offs_m[None, :, None] * stride_c_in_m)
-        + (offs_n[None, None, :] * stride_c_in_n)
-    )
-
-    if ACTUAL_KSPLIT == MAX_KSPLIT:
-        c = tl.load(c_in_ptrs)
+    if ORDER_FOUR_SPLITS and ACTUAL_KSPLIT == 4:
+        # The gfx908 router pairs even and odd partitions. tl.sum chooses a
+        # different floating-point reduction tree across compiler versions.
+        base = (
+            c_in_ptr
+            + offs_m[:, None] * stride_c_in_m
+            + offs_n[None, :] * stride_c_in_n
+        )
+        even = tl.load(base) + tl.load(base + 2 * stride_c_in_k)
+        odd = tl.load(base + stride_c_in_k) + tl.load(base + 3 * stride_c_in_k)
+        c = even + odd
     else:
-        c = tl.load(c_in_ptrs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT, other=0.0)
-    c = tl.sum(c, axis=0)
+        offs_k = tl.arange(0, MAX_KSPLIT)
+        c_in_ptrs = (
+            c_in_ptr
+            + (offs_k[:, None, None] * stride_c_in_k)
+            + (offs_m[None, :, None] * stride_c_in_m)
+            + (offs_n[None, None, :] * stride_c_in_n)
+        )
+
+        if ACTUAL_KSPLIT == MAX_KSPLIT:
+            c = tl.load(c_in_ptrs)
+        else:
+            c = tl.load(
+                c_in_ptrs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT, other=0.0
+            )
+        c = tl.sum(c, axis=0)
 
     if ADD_BIAS:
         acc_dtype = tl.float32 if c_in_ptr.type.element_ty != tl.int8 else tl.int32

@@ -54,6 +54,7 @@ def gemm_a8w8_blockscale(
     output_scales: torch.Tensor | None = None,
     relu2: bool = False,
     bias: torch.Tensor | None = None,
+    order_four_splits: bool = False,
 ):
     """
     Computes 8 bit matrix multiplication Y = X @ W^T using block-wise quantization scales.
@@ -66,6 +67,7 @@ def gemm_a8w8_blockscale(
             scale_k = ceil(K / scale_block_size_k).
         w_scale (torch.Tensor): Block-wise scale for w with shape (scale_n, scale_k).
             scale_n = ceil(N / scale_block_size_n).
+        order_four_splits: Use (p0 + p2) + (p1 + p3) for four split-K partials.
         dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
         y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
         config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
@@ -271,6 +273,7 @@ def gemm_a8w8_blockscale(
             activation="",
             use_activation=False,
             KERNEL_NAME="_gemm_a8w8_blockscale_reduce_kernel",
+            ORDER_FOUR_SPLITS=order_four_splits,
         )
 
     return y
