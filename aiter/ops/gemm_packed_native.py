@@ -268,6 +268,7 @@ def affine_g128(
     clamp_limit=None,
     route_group=0,
     output_dtype=torch.float32,
+    symmetric_w4=False,
 ):
     """G128 W4A8 or symmetric W8A8 with the same tiling and route scatter.
 
@@ -280,6 +281,8 @@ def affine_g128(
         raise ValueError("Expected a matrix of signed INT8 activations")
     m, k = q.shape
     w4 = zero is not None
+    if symmetric_w4 and (not w4 or triton_tiles is None):
+        raise ValueError("A fixed W4 zero point requires the packed Triton GEMM")
     if k % 128 or not 1 <= split <= k // 128 or topk < 1:
         raise ValueError("Invalid G128 geometry, split or route count")
     if weight.ndim != (2 if plan is None else 3):
@@ -306,9 +309,8 @@ def affine_g128(
     if w4 and (
         zero.shape != group_shape
         or zero.dtype != torch.float16
-        or sums is None
-        or sums.shape != scales.shape
-        or sums.dtype != torch.int32
+        or (not symmetric_w4 and sums is None)
+        or (sums is not None and (sums.shape != scales.shape or sums.dtype != torch.int32))
     ):
         raise ValueError(
             "Affine INT4 requires floating zeros and INT32 activation sums"
@@ -412,6 +414,7 @@ def affine_g128(
             CACHED_SCALES=True,
             ASUM=sums,
             WZERO=zero,
+            SYMMETRIC_W4=symmetric_w4,
             AFFINE_WAVE=wave_format,
             BN=tn,
             PACKET_LOAD=packet_load,

@@ -28,8 +28,13 @@ def _load_packet(pointer, offset, words):
     )
 
 
-def _scaled(dot, activation_scale, weight_scale, activation_sum, weight_zero):
-    if weight_zero is not None:
+def _scaled(
+    dot, activation_scale, weight_scale, activation_sum, weight_zero, symmetric=False
+):
+    if symmetric:
+        # The packed, signed nibble was shifted by four before the INT8 MFMA.
+        dot = dot >> 4
+    elif weight_zero is not None:
         # Each signed nibble was shifted to the high half of an INT8 byte.
         # Recover the original unsigned checkpoint dot before applying the
         # floating zero point, preserving the NeUQI affine operation order.
@@ -38,7 +43,9 @@ def _scaled(dot, activation_scale, weight_scale, activation_sum, weight_zero):
     return (fx.Float32(dot) * activation_scale) * weight_scale
 
 
-def _group(w4, operands, geometry, group, previous, output, independent=None):
+def _group(
+    w4, operands, geometry, group, previous, output, independent=None, symmetric=False
+):
     activation, weight, scales, weight_scales, sums, zeros = operands
     lane, tile, activation_row, rows, channels, groups = geometry
     packed_width = 2 if w4 else 4
@@ -51,7 +58,11 @@ def _group(w4, operands, geometry, group, previous, output, independent=None):
             prior * channels + tile * 64 + lane % 32 + 32 * half for half in range(2)
         ]
         scale = [fx.Float32(weight_scales[offset]) for offset in offsets]
-        zero = [fx.Float32(zeros[offset]) for offset in offsets] if w4 else [None] * 2
+        zero = (
+            [fx.Float32(zeros[offset]) for offset in offsets]
+            if w4 and not symmetric
+            else [None] * 2
+        )
         updated = []
     for packet in range(8):
         a = _load_packet(
@@ -87,25 +98,30 @@ def _group(w4, operands, geometry, group, previous, output, independent=None):
                         previous[i],
                         scales[position],
                         scale[i // 16],
-                        sums[position] if w4 else None,
+                        sums[position] if w4 and not symmetric else None,
                         zero[i // 16],
+                        symmetric,
                     )
                 )
     return integer, fx.Vector.from_elements(updated) if draining else output
 
 
-def _wave_product(w4, operands, geometry, first, end, independent=None):
+def _wave_product(
+    w4, operands, geometry, first, end, independent=None, symmetric=False
+):
     """Return the 32 scaled output elements per lane, shared by both epilogues."""
     lane, tile, _, rows, n, groups = geometry
     fp = fx.Vector.from_elements([fx.Float32(0.0)] * 32)
-    integer, _ = _group(w4, operands, geometry, first, None, fp, independent)
+    integer, _ = _group(w4, operands, geometry, first, None, fp, independent, symmetric)
     loop = scf.ForOp(
         (first + 1).ir_value(), end.ir_value(), fx.Int32(1).ir_value(), [integer, fp]
     )
     with ir.InsertionPoint(loop.body):
         group = fx.Int32(loop.induction_variable)
         previous, partial = [fx.Vector(v) for v in loop.inner_iter_args]
-        current, partial = _group(w4, operands, geometry, group, previous, partial)
+        current, partial = _group(
+            w4, operands, geometry, group, previous, partial, symmetric=symmetric
+        )
         scf.YieldOp([current, partial])
     previous, partial = [fx.Vector(v) for v in loop.results]
     _, _, scales, weight_scales, sums, zeros = operands
@@ -118,14 +134,15 @@ def _wave_product(w4, operands, geometry, first, end, independent=None):
             previous[i],
             scales[pos],
             fx.Float32(weight_scales[wpos]),
-            sums[pos] if w4 else None,
-            fx.Float32(zeros[wpos]) if w4 else None,
+            sums[pos] if w4 and not symmetric else None,
+            fx.Float32(zeros[wpos]) if w4 and not symmetric else None,
+            symmetric,
         )
         result.append(partial[i] + last)
     return result
 
 
-def _tile(w4, split, operands, out, m, n, groups):
+def _tile(w4, split, operands, out, m, n, groups, symmetric):
     lane = fx.Int32(fx.gpu.thread_id("x"))
     base_row = fx.Int32(fx.gpu.block_id("x")) * 32
     tile = fx.Int32(fx.gpu.block_id("y"))
@@ -136,7 +153,7 @@ def _tile(w4, split, operands, out, m, n, groups):
     ]
     rows = [_minimum(row, m - 1) for row in actual]
     geometry = lane, tile, _minimum(base_row + lane % 32, m - 1), rows, n, groups
-    product = _wave_product(w4, operands, geometry, first, end)
+    product = _wave_product(w4, operands, geometry, first, end, symmetric=symmetric)
     pitch = ((m + 31) // 32 * 32) * n
     for i in range(32):
         col = tile * 64 + lane % 32 + (i // 16) * 32
@@ -144,7 +161,7 @@ def _tile(w4, split, operands, out, m, n, groups):
 
 
 @cache
-def _make_kernel(w4, split, fp32_weight_scales=False):
+def _make_kernel(w4, split, fp32_weight_scales=False, symmetric=False):
     # Weight-scale pointer precision is part of the compiled launch ABI.
     @flyc.kernel(known_block_size=[64, 1, 1])
     def g128_overlap(
@@ -159,7 +176,7 @@ def _make_kernel(w4, split, fp32_weight_scales=False):
         n: fx.Int32,
         groups: fx.Int32,
     ):
-        _tile(w4, split, (x, w, xs, ws, sums, zeros), y, m, n, groups)
+        _tile(w4, split, (x, w, xs, ws, sums, zeros), y, m, n, groups, symmetric)
 
     @flyc.jit
     def launch(
@@ -193,6 +210,7 @@ def gfx908_g128_overlap(
     weight_scales: torch.Tensor,
     zeros: torch.Tensor | None,
     split: int,
+    symmetric: bool = False,
 ) -> torch.Tensor:
     """Compute the scaled FP32 product, with one FP32 reduction for split K."""
     m, k = x.shape
@@ -206,7 +224,14 @@ def gfx908_g128_overlap(
         )
     fp32_weight_scales = weight_scales.dtype == torch.float32
     scale_type = fx.Float32 if fp32_weight_scales else fx.Float16
-    if split < 1 or n % 64 or k % (split * 128) or (w4 and sums is None):
+    if symmetric and not w4:
+        raise ValueError("A fixed zero point requires packed W4 weights")
+    if (
+        split < 1
+        or n % 64
+        or k % (split * 128)
+        or (w4 and not symmetric and sums is None)
+    ):
         raise ValueError("Expected packed 64-channel tiles and complete K128 stripes")
     if not m:
         return scales.new_empty((0, n))
@@ -218,7 +243,7 @@ def gfx908_g128_overlap(
         weight,
         scales,
         weight_scales,
-        sums if w4 else x,
+        sums if w4 and not symmetric else x,
         zeros if w4 else weight_scales,
         partials,
     )
@@ -237,11 +262,18 @@ def gfx908_g128_overlap(
     ]
     stream = fx.Stream(torch.cuda.current_stream(x.device))
     _run_compiled(
-        _make_kernel(w4, split, fp32_weight_scales), *ptrs, m, n, k // 128, stream
+        _make_kernel(w4, split, fp32_weight_scales, symmetric),
+        *ptrs,
+        m,
+        n,
+        k // 128,
+        stream,
     )
     return (partials[0] if split == 1 else partials.sum(0))[:m]
 
 
 @gfx908_g128_overlap.register_fake
-def _fake_overlap(x, scales, sums, weight, weight_scales, zeros, split):
+def _fake_overlap(
+    x, scales, sums, weight, weight_scales, zeros, split, symmetric=False
+):
     return scales.new_empty((x.shape[0], weight.shape[0]))

@@ -106,15 +106,32 @@ def _quant(
     SUM=None,
     SWIGLU: tl.constexpr = False,
     LIMIT: tl.constexpr = None,
+    ROUTE_ID=None,
+    EXPERT_START: tl.constexpr = 0,
+    EXPERT_STOP: tl.constexpr = 0,
+    GATE_CAP: tl.constexpr = None,
+    UP_CAP: tl.constexpr = None,
 ):
     row, group = tl.program_id(0), tl.program_id(1)
     k = group * 128 + tl.arange(0, 128)
     offset = row.to(tl.int64) * K + k
     if SWIGLU:
         base = row.to(tl.int64) * (2 * K) + k
-        gate = tl.load(X + base, k < K, 0)
-        up = tl.load(X + base + K, k < K, 0)
-        v = _gated_fp16(gate, up, LIMIT)
+        valid = k < K
+        if ROUTE_ID is not None:
+            expert = tl.load(ROUTE_ID + row)
+            valid = valid & (expert >= EXPERT_START) & (expert < EXPERT_STOP)
+        gate = tl.load(X + base, valid, 0)
+        up = tl.load(X + base + K, valid, 0)
+        if GATE_CAP is not None:
+            gate = gate.to(tl.float32)
+            up = up.to(tl.float32)
+            g = tldevice.tanh(gate / GATE_CAP) * GATE_CAP
+            u = tldevice.tanh(up / UP_CAP) * UP_CAP
+            sigmoid = 1.0 / (1.0 + tldevice.exp(-gate))
+            v = (g * sigmoid * u).to(tl.float16).to(tl.float32)
+        else:
+            v = _gated_fp16(gate, up, LIMIT)
     else:
         v = tl.load(X + offset, k < K, 0).to(tl.float32)
     scale = tl.maximum(tl.div_rn(tl.max(tl.abs(v), 0), 127.0), 1.0e-30)
@@ -280,6 +297,7 @@ def _gemm(
     GATE_LIMIT: tl.constexpr = None,
     YSUM=None,
     ROUTE_GROUP_M: tl.constexpr = 0,
+    SYMMETRIC_W4: tl.constexpr = False,
 ):
     slot = -1
     tile_m, tile_n = tl.program_id(0), tl.program_id(1)
@@ -388,9 +406,12 @@ def _gemm(
             0,
         )
         sx = tl.load(XS + xm * tl.cdiv(LENGTH, 128) + group, rm < M, 0)
+        if SYMMETRIC_W4:
+            tl.static_assert(CODEC == "affine_w4")
+            wq = (wq - 8).to(tl.int8)
         dot = tl.dot(x, tl.trans(wq), out_dtype=tl.int32)
         product = dot.to(tl.float32)
-        if CODEC == "affine_w4":
+        if CODEC == "affine_w4" and not SYMMETRIC_W4:
             zx = tl.load(ASUM + xm * groups + group, rm < M, 0).to(tl.float32)
             zw = tl.load(WZERO + gi, rn < N, 0).to(tl.float32)
             product = product - zx[:, None] * zw[None, :]
@@ -448,14 +469,22 @@ def _embedding(
 
 @triton.jit
 def _route_product(
-    Y, WEIGHTS, token, cols, route: tl.constexpr, N: tl.constexpr, TOPK: tl.constexpr
+    Y, WEIGHTS, token, cols, route: tl.constexpr, N: tl.constexpr, TOPK: tl.constexpr,
+    IDS, START: tl.constexpr, STOP: tl.constexpr,
 ):
-    value = tl.load(Y + (token * TOPK + route) * N + cols, cols < N, 0)
+    mask = cols < N
+    if IDS is not None:
+        expert = tl.load(IDS + token * TOPK + route)
+        mask = mask & (expert >= START) & (expert < STOP)
+    value = tl.load(Y + (token * TOPK + route) * N + cols, mask, 0).to(tl.float32)
     return value * tl.load(WEIGHTS + token * TOPK + route).to(tl.float32)
 
 
 @triton.jit
-def _combine_experts(Y, WEIGHTS, OUT, N: tl.constexpr, B: tl.constexpr, TOPK: tl.constexpr = 9):
+def _combine_experts(
+    Y, WEIGHTS, OUT, N: tl.constexpr, B: tl.constexpr, TOPK: tl.constexpr = 9,
+    IDS=None, START: tl.constexpr = 0, STOP: tl.constexpr = 0,
+):
     token = tl.program_id(0)
     cols = tl.program_id(1) * B + tl.arange(0, B)
     # Match the four lane-local accumulators used by the native reduction.
@@ -465,13 +494,13 @@ def _combine_experts(Y, WEIGHTS, OUT, N: tl.constexpr, B: tl.constexpr, TOPK: tl
     a2 = zero
     a3 = zero
     for i in tl.static_range(0, TOPK, 4):
-        a0 += _route_product(Y, WEIGHTS, token, cols, i, N, TOPK)
+        a0 += _route_product(Y, WEIGHTS, token, cols, i, N, TOPK, IDS, START, STOP)
         if i + 1 < TOPK:
-            a1 += _route_product(Y, WEIGHTS, token, cols, i + 1, N, TOPK)
+            a1 += _route_product(Y, WEIGHTS, token, cols, i + 1, N, TOPK, IDS, START, STOP)
         if i + 2 < TOPK:
-            a2 += _route_product(Y, WEIGHTS, token, cols, i + 2, N, TOPK)
+            a2 += _route_product(Y, WEIGHTS, token, cols, i + 2, N, TOPK, IDS, START, STOP)
         if i + 3 < TOPK:
-            a3 += _route_product(Y, WEIGHTS, token, cols, i + 3, N, TOPK)
+            a3 += _route_product(Y, WEIGHTS, token, cols, i + 3, N, TOPK, IDS, START, STOP)
     result = ((a0+a1)+a2)+a3
     result = tl.where(result == 0.0, 0.0, result)
     tl.store(OUT + token * N + cols, result, cols < N)

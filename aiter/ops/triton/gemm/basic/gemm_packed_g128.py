@@ -94,6 +94,27 @@ def quantize(x, *, with_sums=False, swiglu=False, clamp_limit=None):
     return q, s
 
 
+def quantize_routed_swiglu(x, ids, start, stop, *, gate_cap, up_cap, with_sums=True):
+    """Apply softcapped SwiGLU, writing only local expert activations on a G128 grid."""
+    if x.ndim != 2 or x.shape[1] % 2 or x.dtype != torch.float16 or not x.is_cuda:
+        raise ValueError("Expected an FP16 matrix of gate and up projections")
+    rows, width = x.shape
+    if ids.numel() != rows:
+        raise ValueError("Expected one expert ID per projection row")
+    if any(t.device != x.device or not t.is_contiguous() for t in (x, ids)):
+        raise ValueError("Projection rows and routing must be contiguous on the same GPU")
+    if gate_cap <= 0 or up_cap <= 0 or not 0 <= start < stop:
+        raise ValueError("Expected positive softcaps and a nonempty expert range")
+    k = width // 2
+    q = x.new_empty((rows, k), dtype=torch.int8)
+    s = x.new_empty((rows, triton.cdiv(k, 128)), dtype=torch.float32)
+    sums = torch.empty_like(s, dtype=torch.int32) if with_sums else None
+    _quant[(rows, s.shape[1])](
+        x, q, s, k, sums, True, None, ids, start, stop, gate_cap, up_cap
+    )
+    return q, s, sums
+
+
 def packed_gemm(
     q,
     scales,
@@ -256,7 +277,7 @@ def packed_embedding(weight, ids, width, dtype=torch.bfloat16):
     return out
 
 
-def combine_experts(y, weights, dtype):
+def combine_experts(y, weights, dtype, *, ids=None, start=0, stop=0):
     """Fuse route products, native FP32 reduction order and the output cast."""
     if y.ndim != 2 or weights.ndim != 2:
         raise ValueError("Expected route values [M*topk,N] and weights [M,topk]")
@@ -264,22 +285,30 @@ def combine_experts(y, weights, dtype):
     if y.shape[0] != m * topk or y.device != weights.device:
         raise ValueError("Route values and weights must match on the same device")
     n = y.shape[-1]
+    if ids is not None and (
+        ids.shape != weights.shape or ids.device != y.device or not ids.is_contiguous()
+        or not 0 <= start < stop
+    ):
+        raise ValueError("Expected matching expert IDs and a nonempty local range")
     if (
         not y.is_cuda
-        or topk not in (9,16)
+        or topk not in (2, 8, 9, 16)
         or n % 4
-        or y.dtype != torch.float32
+        or y.dtype not in (torch.float16, torch.float32)
         or weights.dtype != torch.float32
         or not y.is_contiguous()
         or not weights.is_contiguous()
         or dtype not in (torch.float32, torch.float16, torch.bfloat16)
     ):
-        return (y.view(m, topk, n) * weights[..., None]).sum(1).to(dtype)
+        rows = y.view(m, topk, n)
+        if ids is not None:
+            rows = torch.where(((ids >= start) & (ids < stop))[..., None], rows, 0)
+        return (rows * weights[..., None]).sum(1).to(dtype)
     output = torch.empty((m, n), device=y.device, dtype=dtype)
     if m and n:
         block = 256 if m <= 64 else 512
         _combine_experts[(m, triton.cdiv(n, block))](
-            y, weights, output, n, block, topk, num_warps=4, enable_fp_fusion=False
+            y, weights, output, n, block, topk, ids, start, stop, num_warps=4, enable_fp_fusion=False
         )
     return output
 
