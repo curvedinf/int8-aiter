@@ -85,11 +85,21 @@ torch::Tensor gemm_a8w8_tune(
   {
     if (Y.dtype() == at::ScalarType::BFloat16)
     {
-      TORCH_CHECK(x_scale.dtype() == at::ScalarType::BFloat16,
-                  "I8 bf16-out tune path supports bf16 scales only, got: " +
-                      std::string(c10::toString(x_scale.dtype())));
-      // INT8 path, bf16 scales + bf16 out (upstream default)
-      rowwise_dispatch<I8, B16, B16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+      if (x_scale.dtype() == at::ScalarType::Float)
+      {
+        // INT8 path, fp32 scales + bf16 out -- matches the <I8, F32, B16>
+        // dispatch in gemm_a8w8.cu
+        rowwise_dispatch<I8, F32, B16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+      }
+      else if (x_scale.dtype() == at::ScalarType::BFloat16)
+      {
+        // INT8 path, bf16 scales + bf16 out (upstream default)
+        rowwise_dispatch<I8, B16, B16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+      }
+      else
+      {
+        TORCH_CHECK(false, "Unsupported scale dtype: " + std::string(c10::toString(x_scale.dtype())));
+      }
     }
     else if (Y.dtype() == at::ScalarType::Half)
     {

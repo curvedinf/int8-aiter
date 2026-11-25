@@ -257,10 +257,17 @@ template torch::Tensor
 """
         if self.istune:
             # Generate tune instances. I8 gets both epilogues: eB16 (upstream
-            # default) and eF16 with dF32/dF16 scale math -- gfx908 production
-            # dispatches <I8, F32, F16> (fp32 scales, fp16 out), so tuning on
-            # eB16-only would measure the wrong template. F8 stays eB16-only.
-            for EDtype, DDtype in [("B16", "B16"), ("F16", "F32"), ("F16", "F16")]:
+            # default) and eF16 with dF32/dF16 scale math. eB16 is reachable
+            # with both scale maths: dB16 (upstream default) and dF32 (fp32
+            # scales + bf16 out, dispatched by gemm_a8w8.cu for bf16
+            # outputs), so tuning on eB16-only would measure the wrong
+            # scale math. F8 stays eB16-only.
+            for EDtype, DDtype in [
+                ("B16", "B16"),
+                ("F16", "F32"),
+                ("F16", "F16"),
+                ("B16", "F32"),
+            ]:
                 INSTANCE_abI8 = INSTANCE_template.format(
                     name=k.name, dtypes=f"I8, {DDtype}, {EDtype}"
                 )
