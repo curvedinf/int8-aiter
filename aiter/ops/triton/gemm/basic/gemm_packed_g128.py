@@ -15,6 +15,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_packed_g128 import (
     _prepare_weight_scales,
     _quant,
     _split_reduce,
+    _tabulated_swiglu_quant,
 )
 
 # Diagnostic module reloads must pick up edited HIP sources and bindings.
@@ -94,7 +95,17 @@ def quantize(x, *, with_sums=False, swiglu=False, clamp_limit=None):
     return q, s
 
 
-def quantize_routed_swiglu(x, ids, start, stop, *, gate_cap, up_cap, with_sums=True):
+def routed_swiglu_factors(device, gate_cap, up_cap):
+    """Tabulate the native FP32 elementwise operations for every FP16 input."""
+    bits = torch.arange(65536, dtype=torch.int32, device=device).to(torch.int16)
+    x = bits.view(torch.float16).float()
+    gate = (x / gate_cap).tanh() * gate_cap
+    return torch.stack((gate * x.sigmoid(), (x / up_cap).tanh() * up_cap))
+
+
+def quantize_routed_swiglu(
+    x, ids, start, stop, *, gate_cap, up_cap, with_sums=True, factors=None
+):
     """Apply softcapped SwiGLU, writing only local expert activations on a G128 grid."""
     if x.ndim != 2 or x.shape[1] % 2 or x.dtype != torch.float16 or not x.is_cuda:
         raise ValueError("Expected an FP16 matrix of gate and up projections")
@@ -105,13 +116,25 @@ def quantize_routed_swiglu(x, ids, start, stop, *, gate_cap, up_cap, with_sums=T
         raise ValueError("Projection rows and routing must be contiguous on the same GPU")
     if gate_cap <= 0 or up_cap <= 0 or not 0 <= start < stop:
         raise ValueError("Expected positive softcaps and a nonempty expert range")
+    if factors is not None and (
+        factors.shape != (2, 65536) or factors.dtype != torch.float32
+        or factors.device != x.device or not factors.is_contiguous()
+    ):
+        raise ValueError("Expected two contiguous FP32 factor tables on the input GPU")
     k = width // 2
     q = x.new_empty((rows, k), dtype=torch.int8)
     s = x.new_empty((rows, triton.cdiv(k, 128)), dtype=torch.float32)
     sums = torch.empty_like(s, dtype=torch.int32) if with_sums else None
-    _quant[(rows, s.shape[1])](
-        x, q, s, k, sums, True, None, ids, start, stop, gate_cap, up_cap
-    )
+    if factors is not None:
+        groups = 16 if rows >= 6144 else 1
+        _tabulated_swiglu_quant[(rows, triton.cdiv(s.shape[1], groups))](
+            x, ids, factors, q, s, sums, start, stop, k, groups,
+            num_warps=4 if groups > 1 else 1,
+        )
+    else:
+        _quant[(rows, s.shape[1])](
+            x, q, s, k, sums, True, None, ids, start, stop, gate_cap, up_cap
+        )
     return q, s, sums
 
 

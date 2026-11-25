@@ -98,6 +98,43 @@ def _gated_fp16(gate, up, LIMIT: tl.constexpr):
 
 
 @triton.jit
+def _symmetric_codes(values):
+    scale = tl.maximum(tl.div_rn(tl.max(tl.abs(values), -1), 127.0), 1.0e-30)
+    divisor = scale[:, None] if len(values.shape) == 2 else scale
+    codes = tldevice.nearbyint(tl.div_rn(values, divisor))
+    return codes, scale
+
+
+@triton.jit
+def _tabulated_swiglu_quant(
+    X, IDS, FACTORS, Q, S, SUM, START: tl.constexpr, STOP: tl.constexpr,
+    K: tl.constexpr, GROUPS: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    groups = tl.cdiv(K, 128)
+    group = tl.program_id(1) * GROUPS + tl.arange(0, GROUPS)
+    col = group[:, None] * 128 + tl.arange(0, 128)[None, :]
+    expert = tl.load(IDS + row)
+    local = (expert >= START) & (expert < STOP)
+    base = X + row * (2 * K) + col
+    gate = tl.load(base, local & (col < K), other=0)
+    up = tl.load(base + K, local & (col < K), other=0)
+    g = tl.load(FACTORS + gate.to(tl.uint16, bitcast=True).to(tl.int32))
+    u = tl.load(FACTORS + 65536 + up.to(tl.uint16, bitcast=True).to(tl.int32))
+    # A mixed FMA rounds the product straight to half on gfx908. Materialize
+    # the reference's FP32 product before its separate FP16 conversion.
+    product = tl.inline_asm_elementwise(
+        "v_mul_f32 $0, $1, $2", "=v,v,v", [g, u], dtype=tl.float32,
+        is_pure=True, pack=1,
+    )
+    codes, scale = _symmetric_codes(product.to(tl.float16).to(tl.float32))
+    tl.store(Q + row * K + col, codes.to(tl.int8), col < K)
+    tl.store(S + row * groups + group, scale, group < groups)
+    if SUM is not None:
+        tl.store(SUM + row * groups + group, tl.sum(codes.to(tl.int32), 1), group < groups)
+
+
+@triton.jit
 def _quant(
     X,
     Q,
@@ -134,8 +171,7 @@ def _quant(
             v = _gated_fp16(gate, up, LIMIT)
     else:
         v = tl.load(X + offset, k < K, 0).to(tl.float32)
-    scale = tl.maximum(tl.div_rn(tl.max(tl.abs(v), 0), 127.0), 1.0e-30)
-    q = tldevice.nearbyint(tl.div_rn(v, scale))
+    q, scale = _symmetric_codes(v)
     tl.store(Q + offset, q.to(tl.int8), k < K)
     index = row.to(tl.int64) * tl.cdiv(K, 128) + group
     tl.store(S + index, scale)
